@@ -922,6 +922,8 @@ class QZoneService:
                     is_retweet = bool(msg_rt_con)
 
                     logger.debug(f"[DEBUG] 说说 {idx+1}/{total_msgs}: tid={msg_tid}, 是否转发={is_retweet}, content长度={len(msg_content)}")
+                    if is_retweet:
+                        logger.debug(f"[DEBUG] rt_con类型={type(msg_rt_con)}, 内容={msg_rt_con}")
 
                     # 当读取的是好友动态时，检查是否已评论过，如果是则跳过
                     is_friend_feed = str(t_qq) != str(uin)
@@ -1025,9 +1027,7 @@ class QZoneService:
                             "created_time": time.strftime(
                                 "%Y-%m-%d %H:%M:%S", time.localtime(msg.get("created_time", 0))
                             ),
-                            "rt_con": msg.get("rt_con", {}).get("content", "")
-                            if isinstance(msg.get("rt_con"), dict)
-                            else "",
+                            "rt_con": msg.get("rt_con", {}).get("content", "") if isinstance(msg.get("rt_con"), dict) else msg.get("rt_con", ""),
                             "images": images,
                             "comments": comments,
                         }
@@ -1238,6 +1238,11 @@ class QZoneService:
 
                     soup = bs4.BeautifulSoup(html_content, "html.parser")
 
+                    # DEBUG: 查找所有可能的文本容器
+                    all_divs = soup.find_all("div")
+                    for i, div in enumerate(all_divs[:10]):  # 只看前10个
+                        div_class = div.get("class", [])
+                        div_text = div.get_text(strip=True)[:50] if div.get_text(strip=True) else ""
                     like_btn = soup.find("a", class_="qz_like_btn_v3")
                     is_liked = False
                     if isinstance(like_btn, bs4.Tag) and like_btn.get("data-islike") == "1":
@@ -1246,8 +1251,22 @@ class QZoneService:
                     if is_liked:
                         continue
 
+                    # 提取说说主体内容（兼容普通说说和转发说说）
                     text_div = soup.find("div", class_="f-info")
+                    if not text_div:
+                        text_div = soup.find("div", class_="qz_summary")
                     text = text_div.get_text(strip=True) if isinstance(text_div, bs4.Tag) else ""
+
+                    # 提取转发内容（从f-item中提取完整内容，然后去除已提取的text部分）
+                    rt_con = ""
+                    f_item_div = soup.find("div", class_="f-item")
+                    if f_item_div:
+                        full_text = f_item_div.get_text(strip=True)
+                        # 如果完整文本包含了说说主体，去除主体部分得到转发内容
+                        if text and full_text.startswith(text):
+                            rt_con = full_text[len(text):].strip()
+                        elif full_text and full_text != text:
+                            rt_con = full_text
 
                     # --- 借鉴原版插件的精确图片提取逻辑 ---
                     image_urls = []
@@ -1311,7 +1330,7 @@ class QZoneService:
                                 )
 
                     feeds_list.append(
-                        {"target_qq": target_qq, "tid": tid, "content": text, "images": images, "comments": comments}
+                        {"target_qq": target_qq, "tid": tid, "content": text, "rt_con": rt_con, "images": images, "comments": comments}
                     )
                 logger.info(f"监控任务发现 {len(feeds_list)} 条未处理的新说说。")
                 return feeds_list
