@@ -1,6 +1,7 @@
 import asyncio
 import datetime
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -43,7 +44,7 @@ TEMP_DIR = os.path.join(ROOT_PATH, "temp", "lpmm_cache")
 # - 控制同时进行的LLM提取请求数量
 # - 推荐值: 3-10，取决于API速率限制
 # - 过高可能触发429错误（速率限制）
-MAX_EXTRACTION_CONCURRENCY = 5
+MAX_EXTRACTION_CONCURRENCY = 12  # 提高并发以加快处理速度（OpenRouter/OpenAI速率限制较宽松）
 
 # 数据导入（步骤3：生成embedding）性能配置
 # - max_workers: 并发批次数（每批次并行处理）
@@ -78,7 +79,21 @@ def clear_cache():
 
 
 def process_text_file(file_path):
-    with open(file_path, encoding="utf-8") as f:
+    # 尝试多种编码格式
+    encodings = ['utf-8', 'gbk', 'gb2312', 'utf-16', 'latin-1']
+
+    for encoding in encodings:
+        try:
+            with open(file_path, encoding=encoding) as f:
+                raw = f.read()
+            logger.debug(f"成功使用 {encoding} 编码读取文件: {file_path}")
+            return [p.strip() for p in raw.split("\n\n") if p.strip()]
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+
+    # 如果所有编码都失败，使用 utf-8 并忽略错误
+    logger.warning(f"无法正确解码文件 {file_path}，使用 UTF-8 并忽略错误")
+    with open(file_path, encoding="utf-8", errors="ignore") as f:
         raw = f.read()
     return [p.strip() for p in raw.split("\n\n") if p.strip()]
 
@@ -109,7 +124,7 @@ def _parse_and_repair_json(json_string: str) -> dict | None:
     """
     尝试解析JSON字符串，如果失败则尝试修复并重新解析。
 
-    该函数首先会清理字符串，去除常见的Markdown代码块标记，
+    该函数首先会清理字符串，去除常见的Markdown代码块标记和思考过程标签，
     然后尝试直接解析。如果解析失败，它会调用 `repair_json`
     进行修复，并再次尝试解析。
 
@@ -123,8 +138,17 @@ def _parse_and_repair_json(json_string: str) -> dict | None:
         logger.error(f"输入内容非字符串，无法解析: {type(json_string)}")
         return None
 
-    # 1. 预处理：去除常见的多余字符，如Markdown代码块标记
+    # 1. 预处理：去除常见的多余字符
     cleaned_string = json_string.strip()
+
+    # 🔧 修复：处理 </think> 标签（某些模型会输出思考过程）
+    if "</think>" in cleaned_string:
+        # 提取 </think> 之后的内容
+        parts = cleaned_string.split("</think>")
+        if len(parts) > 1:
+            cleaned_string = parts[-1].strip()
+
+    # 处理 Markdown 代码块标记
     if cleaned_string.startswith("```json"):
         cleaned_string = cleaned_string[7:].strip()
     elif cleaned_string.startswith("```"):
@@ -135,7 +159,16 @@ def _parse_and_repair_json(json_string: str) -> dict | None:
 
     # 2. 性能优化：乐观地尝试直接解析
     try:
-        return orjson.loads(cleaned_string)
+        result = orjson.loads(cleaned_string)
+        # 🔧 修复：确保返回的是字典而不是列表
+        if isinstance(result, list):
+            logger.warning(f"解析结果是列表而非字典，尝试提取第一个元素: {result}")
+            if result and isinstance(result[0], dict):
+                return result[0]
+            else:
+                logger.error(f"无法从列表中提取有效字典: {result}")
+                return None
+        return result
     except orjson.JSONDecodeError:
         logger.warning("直接解析JSON失败，将尝试修复...")
 
@@ -143,13 +176,46 @@ def _parse_and_repair_json(json_string: str) -> dict | None:
         repaired_json_str = ""
         try:
             repaired_json_str = repair_json(cleaned_string)
-            return orjson.loads(repaired_json_str)
+            result = orjson.loads(repaired_json_str)
+            # 🔧 修复：确保返回的是字典而不是列表
+            if isinstance(result, list):
+                logger.warning(f"修复后的结果是列表而非字典，尝试提取第一个元素: {result}")
+                if result and isinstance(result[0], dict):
+                    return result[0]
+                else:
+                    logger.error(f"无法从列表中提取有效字典: {result}")
+                    return None
+            return result
         except Exception as e:
             # 4. 增强错误处理：记录详细的失败信息
             logger.error(f"修复并解析JSON后依然失败: {e}")
-            logger.error(f"原始字符串 (清理后): {cleaned_string}")
-            logger.error(f"修复后尝试解析的字符串: {repaired_json_str}")
+            logger.error(f"原始字符串 (清理后): {cleaned_string[:500]}...")  # 只记录前500字符
+            logger.error(f"修复后尝试解析的字符串: {repaired_json_str[:500]}...")
             return None
+
+
+def clean_xml_invalid_chars(text: str) -> str:
+    """
+    清理字符串中的非法 XML 字符。
+
+    XML 1.0 规范允许的字符范围：
+    - #x9 | #xA | #xD | [#x20-#xD7FF] | [#xE000-#xFFFD] | [#x10000-#x10FFFF]
+
+    Args:
+        text: 需要清理的字符串
+
+    Returns:
+        清理后的字符串
+    """
+    if not isinstance(text, str):
+        return text
+
+    # 移除非法的 XML 字符（保留 tab、换行、回车以及正常可打印字符）
+    # 参考：https://www.w3.org/TR/xml/#charsets
+    illegal_xml_chars = re.compile(
+        r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x84\x86-\x9F\uD800-\uDFFF\uFFFE\uFFFF]'
+    )
+    return illegal_xml_chars.sub('', text)
 
 
 def get_extraction_prompt(paragraph: str) -> str:
@@ -209,11 +275,18 @@ async def extract_info_async(pg_hash, paragraph, llm_api):
         if extracted_data is None:
             raise ValueError("无法从LLM输出中解析有效的JSON数据")
 
+        # 🔧 修复：清理实体和三元组中的非法 XML 字符，避免保存时 ExpatError
+        entities = [clean_xml_invalid_chars(e) for e in extracted_data.get("entities", [])]
+        triples = [
+            [clean_xml_invalid_chars(str(item)) for item in triple]
+            for triple in extracted_data.get("triples", [])
+        ]
+
         doc_item = {
             "idx": pg_hash,
-            "passage": paragraph,
-            "extracted_entities": extracted_data.get("entities", []),
-            "extracted_triples": extracted_data.get("triples", []),
+            "passage": clean_xml_invalid_chars(paragraph),
+            "extracted_entities": entities,
+            "extracted_triples": triples,
         }
 
         # 保存到缓存（异步写入）
@@ -359,6 +432,17 @@ async def import_data(openie_obj: OpenIE | None = None):
 
     raw_paragraphs = openie_data.extract_raw_paragraph_dict()
     triple_list_data = openie_data.extract_triple_dict()
+
+    # 🔧 修复：清理所有三元组中的非法 XML 字符
+    cleaned_triple_list_data = {}
+    for p_hash, triples in triple_list_data.items():
+        cleaned_triples = [
+            [clean_xml_invalid_chars(str(item)) for item in triple]
+            for triple in triples
+        ]
+        cleaned_triple_list_data[p_hash] = cleaned_triples
+
+    triple_list_data = cleaned_triple_list_data
 
     new_raw_paragraphs, new_triple_list_data = {}, {}
     stored_embeds = embed_manager.stored_pg_hashes
