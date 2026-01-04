@@ -446,7 +446,7 @@ class AffinityInterestCalculator(BaseInterestCalculator):
             return 0.0
 
         try:
-            score = await self.semantic_scorer.score_async(content, timeout=2.0)
+            score = await self.semantic_scorer.score_async(content, timeout=5.0)  # 本地Ollama需要更长超时
 
             logger.debug(f"[语义评分] 内容: '{content[:50]}...' -> 分数: {score:.3f}")
             return score
