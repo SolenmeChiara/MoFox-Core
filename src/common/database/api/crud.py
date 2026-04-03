@@ -11,6 +11,7 @@ from functools import lru_cache
 from typing import Any, Generic, TypeVar
 
 from sqlalchemy import delete, func, select, update
+from sqlalchemy.exc import IntegrityError
 
 from src.common.database.core.session import get_db_session
 from src.common.database.optimization import (
@@ -491,8 +492,16 @@ class CRUDBase(Generic[T]):
         if defaults:
             create_data.update(defaults)
 
-        instance = await self.create(create_data)
-        return instance, True
+        try:
+            instance = await self.create(create_data)
+            return instance, True
+        except IntegrityError:
+            # 并发竞态：另一个请求已经创建了该记录，重新获取
+            instance = await self.get_by(use_cache=False, **filters)
+            if instance is not None:
+                return instance, False
+            # 如果仍然获取不到，则抛出原始异常
+            raise
 
     async def bulk_create(
         self,

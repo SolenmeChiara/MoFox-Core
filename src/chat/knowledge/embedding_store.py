@@ -130,8 +130,10 @@ class EmbeddingStore:
         """异步、安全地获取单个字符串的嵌入向量"""
         try:
             embedding, _ = await llm.get_embedding(s)
-            if embedding and len(embedding) > 0:
-                return embedding
+            # 修复: 使用 is not None 避免 numpy 数组布尔判断问题
+            if embedding is not None and len(embedding) > 0:
+                # 修复: 转换为 Python 原生 float，避免 numpy.float32 问题
+                return [float(x) for x in embedding]
             else:
                 logger.error(f"获取嵌入失败: {s}")
                 return []
@@ -213,8 +215,10 @@ class EmbeddingStore:
         # 构建测试向量字典
         test_vectors = {}
         for idx, (s, embedding) in enumerate(embedding_results):
-            if embedding:
-                test_vectors[str(idx)] = embedding
+            # 修复: 使用 is not None 和 len() 避免 numpy 数组布尔判断问题
+            if embedding is not None and len(embedding) > 0:
+                # 修复: 转换为 Python 原生 float，避免 numpy.float32 序列化问题
+                test_vectors[str(idx)] = [float(x) for x in embedding]
             else:
                 logger.error(f"获取测试字符串嵌入失败: {s}")
                 # Since _get_embedding is problematic, we just fail here
@@ -326,8 +330,11 @@ class EmbeddingStore:
                 # 存入结果
                 for s, embedding in embedding_results:
                     item_hash = self.namespace + "-" + get_sha256(s)
-                    if embedding:  # 只有成功获取到嵌入才存入
-                        self.store[item_hash] = EmbeddingStoreItem(item_hash, embedding, s)
+                    # 修复: 使用 is not None 和 len() 避免 numpy 数组布尔判断问题
+                    if embedding is not None and len(embedding) > 0:
+                        # 修复: 转换为 Python 原生 float，避免 numpy.float32 问题
+                        emb_list = [float(x) for x in embedding]
+                        self.store[item_hash] = EmbeddingStoreItem(item_hash, emb_list, s)
                     else:
                         logger.warning(f"跳过存储失败的嵌入: {s[:50]}...")
 

@@ -371,7 +371,8 @@ async def extract_information(paragraphs_dict, model_set):
             progress.update(task, advance=1)
 
     if open_ie_docs:
-        all_entities = [e for doc in open_ie_docs for e in doc["extracted_entities"]]
+        # 强制转换为字符串，避免 LLM 返回数字类型导致 len() 失败
+        all_entities = [str(e) for doc in open_ie_docs for e in doc["extracted_entities"]]
         num_entities = len(all_entities)
         avg_ent_chars = round(sum(len(e) for e in all_entities) / num_entities, 4) if num_entities else 0
         avg_ent_words = round(sum(len(e.split()) for e in all_entities) / num_entities, 4) if num_entities else 0

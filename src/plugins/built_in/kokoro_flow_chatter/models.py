@@ -202,8 +202,8 @@ class MentalLogEntry:
             metadata=data.get("metadata", {}),
         )
 
-    def get_time_str(self, format: str = "%H:%M") -> str:
-        """获取格式化的时间字符串"""
+    def get_time_str(self, format: str = "%m-%d %H:%M") -> str:
+        """获取格式化的时间字符串（含日期，便于跨天区分）"""
         return time.strftime(format, time.localtime(self.timestamp))
 
 

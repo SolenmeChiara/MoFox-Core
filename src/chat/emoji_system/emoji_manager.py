@@ -687,7 +687,6 @@ class EmojiManager:
     -   主题符合："{global_config.emoji.filtration_prompt}"。
     -   内容健康，无不良元素。
     -   必须是表情包，非普通截图。
-    -   图中文字不超过5个。
 请确保你的最终输出是严格的JSON对象，不要添加任何额外解释或文本。
 输出格式:
 ```json

@@ -43,7 +43,7 @@ class ScheduleLLMGenerator:
         """
         now = datetime.now()
         today_str = now.strftime("%Y-%m-%d")
-        weekday = now.strftime("%A")
+        weekday = ["一", "二", "三", "四", "五", "六", "日"][now.weekday()]
 
         # 使用 lunar_python 库获取农历和节日信息
         lunar = Lunar.fromDate(now)
