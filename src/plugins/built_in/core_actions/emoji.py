@@ -67,7 +67,9 @@ class EmojiAction(BaseAction):
     """
 
     # 动作参数定义
-    action_parameters: ClassVar = {}
+    action_parameters: ClassVar = {
+        "emotion": "你想通过这个表情包表达的具体情感，例如'无奈但觉得好笑'、'故作嫌弃'、'得意'等",
+    }
 
     # 动作使用场景
     action_require: ClassVar = [
@@ -93,8 +95,8 @@ class EmojiAction(BaseAction):
         logger.info(f"{self.log_prefix} 决定发送表情")
 
         try:
-            # 1. 获取发送表情的原因
-            reason = self.action_data.get("reason", "表达当前情绪")
+            # 1. 获取发送表情的原因（优先用 planner 传入的具体情感）
+            reason = self.action_data.get("emotion") or self.action_data.get("reason", "表达当前情绪")
             main_reply_content = self.action_data.get("main_reply_content", "")
             logger.info(f"{self.log_prefix} 发送表情原因: {reason}")
 
