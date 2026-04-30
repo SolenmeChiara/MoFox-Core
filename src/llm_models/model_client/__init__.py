@@ -8,3 +8,5 @@ if "aiohttp_gemini" in used_client_types:
     from . import aiohttp_gemini_client  # noqa: F401
 if "bedrock" in used_client_types:
     from . import bedrock_client  # noqa: F401
+if "anthropic" in used_client_types:
+    from . import anthropic_client  # noqa: F401

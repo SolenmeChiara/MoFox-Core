@@ -186,7 +186,15 @@ class LLMUsageRecorder:
         time_cost: float,
     ):
         """实际执行数据库写入"""
-        input_cost = (model_usage.prompt_tokens / 1000000) * model_info.price_in
+        # Anthropic prompt caching 修正：cache_read 只收 10%，cache_create 收 125%，其余按 100%
+        cache_read = model_usage.cache_read_tokens or 0
+        cache_create = model_usage.cache_creation_tokens or 0
+        non_cache_input = max(0, (model_usage.prompt_tokens or 0) - cache_read - cache_create)
+        input_cost = (
+            non_cache_input / 1000000 * model_info.price_in
+            + cache_read / 1000000 * model_info.price_in * 0.10
+            + cache_create / 1000000 * model_info.price_in * 1.25
+        )
         output_cost = (model_usage.completion_tokens / 1000000) * model_info.price_out
         total_cost = round(input_cost + output_cost, 6)
 

@@ -27,13 +27,19 @@ class UsageRecord:
     """提供商名称"""
 
     prompt_tokens: int = 0
-    """提示token数"""
+    """提示token数（包含 cache_read 和 cache_creation 部分，是输入 token 的总数）"""
 
     completion_tokens: int = 0
     """完成token数"""
 
     total_tokens: int = 0
     """总token数"""
+
+    cache_read_tokens: int = 0
+    """缓存命中读取的 token 数（成本为 base_price × 0.10），仅 Anthropic 客户端会填"""
+
+    cache_creation_tokens: int = 0
+    """缓存写入创建的 token 数（成本为 base_price × 1.25 for 5m TTL），仅 Anthropic 客户端会填"""
 
 
 @dataclass

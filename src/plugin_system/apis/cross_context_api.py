@@ -76,7 +76,7 @@ async def build_cross_context_s4u(
                 title = f'[以下是您与"{chat_name}"的近期私聊记录]\n'
 
                 # 格式化消息为可读字符串
-                formatted, _ = await build_readable_messages_with_id(private_messages, timestamp_mode="relative")
+                formatted, _ = await build_readable_messages_with_id(private_messages, timestamp_mode="normal_no_YMD")
                 private_context_block = f"{title}{formatted}"
                 logger.debug(f"[S4U] Generated private context block of length {len(private_context_block)}.")
         except Exception as e:
@@ -151,7 +151,7 @@ async def build_cross_context_s4u(
                 chat_name = await chat_manager.get_stream_name(item["stream_id"]) or "未知群聊"
                 user_name = target_user_info.get("person_name") or target_user_info.get("user_nickname") or user_id
                 title = f'[以下是"{user_name}"在"{chat_name}"的近期发言]\n'
-                formatted, _ = await build_readable_messages_with_id(item["messages"], timestamp_mode="relative")
+                formatted, _ = await build_readable_messages_with_id(item["messages"], timestamp_mode="normal_no_YMD")
                 group_context_blocks.append(f"{title}{formatted}")
             except Exception as e:
                 logger.error(f"S4U模式下格式化群聊消息失败 (stream: {item['stream_id']}): {e}")
@@ -210,7 +210,7 @@ async def build_cross_context_for_user(
             if private_messages := messages_by_stream.get(private_stream_id):
                 chat_name = await chat_manager.get_stream_name(private_stream_id) or "私聊"
                 title = f'[以下是您与"{chat_name}"的近期私聊记录]\n'
-                formatted, _ = await build_readable_messages_with_id(private_messages, timestamp_mode="relative")
+                formatted, _ = await build_readable_messages_with_id(private_messages, timestamp_mode="normal_no_YMD")
                 private_context_block = f"{title}{formatted}"
         except Exception as e:
             logger.error(f"[S4U_SIMPLE] 处理私聊记录失败: {e}")
@@ -247,7 +247,7 @@ async def build_cross_context_for_user(
                 chat_name = await chat_manager.get_stream_name(item["stream_id"]) or "未知群聊"
                 user_name = user_id # 简化处理
                 title = f'[以下是"{user_name}"在"{chat_name}"的近期发言]\n'
-                formatted, _ = await build_readable_messages_with_id(item["messages"], timestamp_mode="relative")
+                formatted, _ = await build_readable_messages_with_id(item["messages"], timestamp_mode="normal_no_YMD")
                 group_context_blocks.append(f"{title}{formatted}")
             except Exception as e:
                 logger.error(f"[S4U_SIMPLE] 格式化群聊消息失败 (stream: {item['stream_id']}): {e}")

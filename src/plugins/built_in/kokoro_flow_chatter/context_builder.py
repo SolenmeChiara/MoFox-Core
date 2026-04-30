@@ -152,7 +152,7 @@ class KFCContextBuilder:
             return await build_readable_messages(
                 msg_dicts,
                 replace_bot_name=True,
-                timestamp_mode="relative",
+                timestamp_mode="normal_no_YMD",
                 truncate=True,
             )
         except Exception as e:

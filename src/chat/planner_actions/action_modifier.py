@@ -144,7 +144,7 @@ class ActionModifier:
             message_list_before_now_half,
             replace_bot_name=True,
             merge_messages=False,
-            timestamp_mode="relative",
+            timestamp_mode="normal_no_YMD",
             read_mark=0.0,
             show_actions=True,
         )
