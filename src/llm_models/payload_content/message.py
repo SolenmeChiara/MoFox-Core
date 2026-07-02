@@ -16,6 +16,13 @@ class RoleType(Enum):
 
 SUPPORTED_IMAGE_FORMATS = ["jpg", "jpeg", "png", "webp", "gif"]  # openai支持的图片格式
 
+# Anthropic prompt caching 缓存断点标记。
+# 提示词构建方（如 replyer 模板）在「静态前缀 / 动态内容」的分界处插入该标记：
+# - anthropic 客户端会在标记处把文本拆成两个 content block，并在前一块上打 cache_control，
+#   使静态前缀（系统提示词 + 人设等）能命中 Anthropic 的 prompt cache；
+# - 其他客户端（openai/gemini/bedrock）在发送前会把该标记原样移除，不影响提示词内容。
+CACHE_BREAKPOINT_MARKER = "<<<MOFOX_CACHE_BREAKPOINT>>>"
+
 
 class Message:
     def __init__(

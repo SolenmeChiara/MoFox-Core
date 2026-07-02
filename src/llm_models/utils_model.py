@@ -37,7 +37,7 @@ from src.config.config import model_config
 
 from .exceptions import NetworkConnectionError, ReqAbortException, RespNotOkException, RespParseException
 from .model_client.base_client import APIResponse, BaseClient, UsageRecord, client_registry
-from .payload_content.message import Message, MessageBuilder, RoleType
+from .payload_content.message import CACHE_BREAKPOINT_MARKER, Message, MessageBuilder, RoleType
 from .payload_content.system_prompt import SYSTEM_PROMPT
 from .payload_content.tool_option import ToolCall, ToolOption, ToolOptionBuilder
 from .utils import compress_messages, llm_usage_recorder
@@ -823,6 +823,9 @@ class _RequestStrategy:
                     processed_prompt = await self.prompt_processor.prepare_prompt(
                         prompt, model_info, self.task_name
                     )
+                    # 缓存断点标记只有 anthropic 客户端能识别，其他客户端发送前原样移除
+                    if api_provider.client_type != "anthropic" and CACHE_BREAKPOINT_MARKER in processed_prompt:
+                        processed_prompt = processed_prompt.replace(CACHE_BREAKPOINT_MARKER, "")
                     message_list = []
                     if self.system_prompt:
                         system_message = (
@@ -1032,6 +1035,9 @@ class LLMRequest:
             message_list=[message],
             temperature=temperature,
             max_tokens=max_tokens,
+            # 图像路径绕过了策略层，必须在这里手动合并模型的 extra_params
+            # （否则 thinking_level 等模型级配置在识图时不生效）
+            extra_params=model_info.extra_params or None,
         )
 
         await self._record_usage(model_info, response.usage, time.time() - start_time, "/chat/completions")

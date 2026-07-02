@@ -28,6 +28,7 @@ from src.common.data_models.database_data_model import DatabaseMessages
 from src.common.logger import get_logger
 from src.config.config import global_config, model_config
 from src.individuality.individuality import get_individuality
+from src.llm_models.payload_content.message import CACHE_BREAKPOINT_MARKER
 from src.llm_models.utils_model import LLMRequest
 from src.mood.mood_manager import mood_manager
 from src.person_info.person_info import get_person_info_manager
@@ -78,10 +79,14 @@ def init_prompt():
     )
 
     # s4u 风格的 prompt 模板
+    # 人设之后插入缓存断点标记：人设（含系统提示词）是跨请求稳定的静态前缀，
+    # anthropic 客户端会在此处打 cache_control 实现 prompt caching；其他客户端会移除该标记
     Prompt(
         """
 # 人设：{identity}
-
+"""
+        + CACHE_BREAKPOINT_MARKER
+        + """
 
 ## 当前状态
 - 你现在的心情是：{mood_state}
@@ -174,6 +179,9 @@ If you need to use the search tool, please directly call the function "lpmm_sear
     Prompt(
         """
 # 人设：{identity}
+"""
+        + CACHE_BREAKPOINT_MARKER
+        + """
 
 ## 当前状态
 - 你现在的心情是：{mood_state}
@@ -1689,8 +1697,9 @@ class DefaultReplyer:
         # normal: 对未读消息的统一回应
         template_name = "s4u_style_prompt" if prompt_mode == "s4u" else "normal_style_prompt"
 
-        # 获取模板内容
-        template_prompt = await global_prompt_manager.get_prompt_async(template_name)
+        # 获取模板内容（传入 prompt_parameters，使Prompt注入组件能拿到 user_id/chat_id 等
+        # 上下文做会话匹配——不传的话注入组件收到的 params 是空的）
+        template_prompt = await global_prompt_manager.get_prompt_async(template_name, prompt_parameters)
         prompt = Prompt(template=template_prompt.template, parameters=prompt_parameters)
         prompt_text = await prompt.build()
 

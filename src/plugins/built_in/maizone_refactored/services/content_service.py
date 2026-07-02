@@ -12,6 +12,7 @@ import aiohttp
 import filetype
 
 from src.common.logger import get_logger
+from src.llm_models.payload_content.message import CACHE_BREAKPOINT_MARKER
 from src.llm_models.utils_model import LLMRequest
 from src.plugin_system.apis import config_api, llm_api, person_api
 
@@ -76,10 +77,12 @@ class ContentService:
             personality_desc += f"\n\n你的表达方式：{bot_reply_style}"
 
             # 构建提示词
+            # 人设（含表达方式，静态大块）之后插入缓存断点标记：anthropic 客户端会在此处
+            # 拆块打 cache_control 命中 prompt cache；其他客户端发送前自动剥离标记
             prompt_topic = f"主题是'{topic}'" if topic else "主题不限"
             prompt = f"""
 {personality_desc}
-
+{CACHE_BREAKPOINT_MARKER}
 现在是{current_time}（{weekday}），你想写一条{prompt_topic}的说说发表在qq空间上。
 
 请严格遵守以下规则：
@@ -282,9 +285,10 @@ class ContentService:
 """
                 output_format = """{"text": "说说正文内容", "image": {"prompt": "详细的英文描述（主体+场景+氛围+光线+细节）"}}"""
 
+            # 人设块后插入缓存断点标记（anthropic 命中缓存用，其他客户端自动剥离）
             prompt = f"""
 {personality_desc}
-
+{CACHE_BREAKPOINT_MARKER}
 现在是{current_time}（{weekday}），你想写一条{prompt_topic}的说说发表在qq空间上。
 
 **说说文本规则：**
@@ -629,7 +633,7 @@ class ContentService:
 # 人设定义
 
 {personality_block}
-
+{CACHE_BREAKPOINT_MARKER}
 # 用户关系
 
 {relation_info}{safety_block}
@@ -814,7 +818,7 @@ class ContentService:
 # 人设定义
 
 {personality_block}
-
+{CACHE_BREAKPOINT_MARKER}
 # 用户关系
 
 {relation_info}{safety_block}

@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Optional
 from src.chat.utils.prompt import global_prompt_manager
 from src.common.logger import get_logger
 from src.config.config import global_config
+from src.llm_models.payload_content.message import CACHE_BREAKPOINT_MARKER
 
 from ..models import EventType, MentalLogEntry
 from ..session import KokoroSession
@@ -100,6 +101,9 @@ class PromptBuilder:
         output_format = await self._get_planner_output_format()
 
         # 8. 使用统一的 prompt 管理系统格式化
+        # Planner 分离模式下，标记之前的段落（人设/关系/安全准则/决策指导/记忆/工具）全部是
+        # 静态占位或配置常量，可作为 prompt cache 前缀；anthropic 客户端在标记处打 cache_control，
+        # 其他客户端发送前自动剥离标记
         prompt = await global_prompt_manager.format_prompt(
             PROMPT_NAMES["main"],
             user_name=user_name,
@@ -109,6 +113,7 @@ class PromptBuilder:
             relation_block=relation_block,
             memory_block=memory_block or "（暂无相关记忆）",
             tool_info=tool_info or "（暂无工具信息）",
+            cache_breakpoint=CACHE_BREAKPOINT_MARKER,
             expression_habits=expression_habits or "（根据自然对话风格回复即可）",
             activity_stream=activity_stream or "（这是你们第一次聊天）",
             current_situation=current_situation,
@@ -1237,6 +1242,9 @@ class PromptBuilder:
         # 1.5. 构建安全互动准则块
         safety_guidelines_block = self._build_safety_guidelines_block()
 
+        # 1.6. 构建自定义决策提示词块（模板含 {custom_decision_block} 占位符，缺了会格式化报错）
+        custom_decision_block = self._build_custom_decision_block()
+
         # 2. 使用 context_builder 获取关系、记忆、表达习惯等
         context_data = await self._build_context_data(user_name, chat_stream, user_id)
         relation_block = context_data.get("relation_info", f"你与 {user_name} 还不太熟悉，这是早期的交流阶段。")
@@ -1262,14 +1270,18 @@ class PromptBuilder:
         output_format = await self._get_unified_output_format()
 
         # 8. 使用统一的 prompt 管理系统格式化
+        # 统一模式的 relation/memory 块每次请求都在变（context_builder 按消息检索），
+        # 打断点只会让缓存"每次写入、从不命中"（白付 1.25x 写入费），故传空串
         prompt = await global_prompt_manager.format_prompt(
             PROMPT_NAMES["main"],
             user_name=user_name,
             persona_block=persona_block,
             safety_guidelines_block=safety_guidelines_block,
+            custom_decision_block=custom_decision_block,
             relation_block=relation_block,
             memory_block=memory_block or "（暂无相关记忆）",
             tool_info=tool_info or "（暂无工具信息）",
+            cache_breakpoint="",
             expression_habits=expression_habits or "（根据自然对话风格回复即可）",
             activity_stream=activity_stream or "（这是你们第一次聊天）",
             current_situation=current_situation,

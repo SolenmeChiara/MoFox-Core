@@ -29,7 +29,7 @@ from ..exceptions import (
     RespNotOkException,
     RespParseException,
 )
-from ..payload_content.message import Message, RoleType
+from ..payload_content.message import CACHE_BREAKPOINT_MARKER, Message, RoleType
 from ..payload_content.resp_format import RespFormat
 from ..payload_content.tool_option import ToolCall, ToolOption, ToolOptionBuilder, ToolParamType
 from .base_client import APIResponse, BaseClient, UsageRecord, client_registry
@@ -37,7 +37,19 @@ from .base_client import APIResponse, BaseClient, UsageRecord, client_registry
 logger = get_logger("Anthropic客户端")
 
 ANTHROPIC_VERSION = "2023-06-01"
-DEFAULT_CACHE_TTL = "5m"  # 5 分钟默认 TTL；如需更长改成 "1h"
+DEFAULT_CACHE_TTL = "1h"  # 1h TTL：写入费 2x（5m 为 1.25x）但读只要 0.1x，bot 流量稀疏（间隔常超 5 分钟）时更划算；如需改回填 "5m"
+MAX_CACHE_BREAKPOINTS = 4  # Anthropic 单次请求最多允许 4 个 cache_control 断点
+
+# extra_params 中思考/努力程度相关的友好配置键（会被翻译成 Anthropic 原生参数，不会原样发给 API）
+VALID_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+
+# 这些模型家族已移除采样参数（temperature/top_p/top_k），发送会直接返回 400
+_NO_SAMPLING_MODEL_KEYWORDS = ("claude-fable", "claude-mythos", "claude-opus-4-7", "claude-opus-4-8")
+
+
+def _model_rejects_sampling_params(model_identifier: str) -> bool:
+    """Fable 5 / Mythos 5 / Opus 4.7+ 不接受采样参数"""
+    return any(keyword in model_identifier for keyword in _NO_SAMPLING_MODEL_KEYWORDS)
 
 
 _PARAM_TYPE_MAP = {
@@ -89,17 +101,41 @@ def _split_messages(messages: list[Message]) -> tuple[list[dict[str, Any]], list
 
 
 def _flatten_text(content: Any) -> str:
-    """把 message.content 拍平成纯文本（忽略图片）"""
+    """把 message.content 拍平成纯文本（忽略图片，并移除缓存断点标记）"""
     if isinstance(content, str):
-        return content
+        return content.replace(CACHE_BREAKPOINT_MARKER, "")
     if isinstance(content, list):
         parts: list[str] = []
         for item in content:
             if isinstance(item, str):
-                parts.append(item)
+                parts.append(item.replace(CACHE_BREAKPOINT_MARKER, ""))
             # 图片元组在文本场景被忽略
         return "\n".join(parts)
     return ""
+
+
+def _split_cached_text_blocks(text: str) -> list[dict[str, Any]]:
+    """按缓存断点标记拆分文本为多个 content block。
+
+    标记之前的片段会带上 cache_control，使「静态前缀」可以命中 prompt cache；
+    标记之后的动态内容保持不缓存。无标记时退化为单个 text block。
+    """
+    if CACHE_BREAKPOINT_MARKER not in text:
+        return [{"type": "text", "text": text}] if text else []
+
+    blocks: list[dict[str, Any]] = []
+    segments = text.split(CACHE_BREAKPOINT_MARKER)
+    for i, seg in enumerate(segments):
+        is_boundary = i < len(segments) - 1
+        if seg.strip():
+            block: dict[str, Any] = {"type": "text", "text": seg}
+            if is_boundary:
+                block["cache_control"] = _cache_control_payload()
+            blocks.append(block)
+        elif is_boundary and blocks:
+            # 标记前是空白片段时，把断点挂到上一个已有的块上
+            blocks[-1]["cache_control"] = _cache_control_payload()
+    return blocks
 
 
 def _build_content_blocks(msg: Message) -> list[dict[str, Any]]:
@@ -107,14 +143,14 @@ def _build_content_blocks(msg: Message) -> list[dict[str, Any]]:
     blocks: list[dict[str, Any]] = []
     if isinstance(msg.content, str):
         if msg.content:
-            blocks.append({"type": "text", "text": msg.content})
+            blocks.extend(_split_cached_text_blocks(msg.content))
         return blocks
 
     if isinstance(msg.content, list):
         for item in msg.content:
             if isinstance(item, str):
                 if item:
-                    blocks.append({"type": "text", "text": item})
+                    blocks.extend(_split_cached_text_blocks(item))
             elif isinstance(item, tuple) and len(item) == 2:
                 fmt, b64 = item
                 media_type = f"image/{fmt.lower().replace('jpg', 'jpeg')}"
@@ -157,10 +193,94 @@ def _convert_tools(tool_options: list[ToolOption]) -> list[dict[str, Any]]:
     return tools
 
 
+def _extract_thinking_options(
+    extra: dict[str, Any], max_tokens: int, model_name: str
+) -> tuple[dict[str, Any] | None, str | None, int]:
+    """从 extra_params 中取出思考/努力程度相关的友好配置，翻译成 Anthropic 原生参数。
+
+    支持的配置键（均会从 extra 中弹出，不会原样发给 API）:
+    - enable_adaptive_thinking: bool  自适应思考（Claude Opus 4.6 / Sonnet 4.6 及更新模型）
+    - enable_thinking: bool           传统扩展思考开关（旧模型，使用 budget_tokens）
+    - thinking_budget: int            扩展思考的 token 预算（仅 enable_thinking=true 时生效，最小 1024）
+    - effort: str                     努力程度 low/medium/high/xhigh/max（写入 output_config.effort）
+
+    enable_adaptive_thinking 与 enable_thinking 在 Anthropic API 层面互斥，
+    两者同时开启时优先使用自适应思考并告警。
+
+    Returns:
+        (thinking 字段, effort 等级, 调整后的 max_tokens)
+    """
+    adaptive = bool(extra.pop("enable_adaptive_thinking", False))
+    enable = extra.pop("enable_thinking", None)
+    budget = extra.pop("thinking_budget", None)
+    effort = extra.pop("effort", None)
+
+    thinking: dict[str, Any] | None = None
+    if adaptive:
+        if enable:
+            logger.warning(
+                f"[{model_name}] enable_adaptive_thinking 与 enable_thinking 同时开启（二者互斥），"
+                "优先使用自适应思考(adaptive)"
+            )
+        thinking = {"type": "adaptive"}
+    elif enable:
+        budget_tokens = max(1024, int(budget or 1024))
+        if budget_tokens >= max_tokens:
+            # Anthropic 要求 budget_tokens < max_tokens，且思考 token 计入 max_tokens，这里自动扩容
+            new_max = budget_tokens + max_tokens
+            logger.info(
+                f"[{model_name}] 思考预算({budget_tokens}) >= max_tokens({max_tokens})，"
+                f"已自动将 max_tokens 提升至 {new_max} 以容纳思考输出"
+            )
+            max_tokens = new_max
+        thinking = {"type": "enabled", "budget_tokens": budget_tokens}
+
+    if effort is not None and effort not in VALID_EFFORT_LEVELS:
+        logger.warning(f"[{model_name}] 无效的 effort 等级: {effort!r}（可选 {VALID_EFFORT_LEVELS}），已忽略")
+        effort = None
+
+    return thinking, effort, max_tokens
+
+
+def _enforce_breakpoint_limit(body: dict[str, Any], limit: int = MAX_CACHE_BREAKPOINTS) -> None:
+    """确保整个请求的 cache_control 断点数不超过 Anthropic 上限（4 个）。
+
+    超限时从最早的消息断点开始移除（保留更深的前缀断点，命中收益更大）。
+    """
+    fixed = 0
+    for section in ("tools", "system"):
+        for block in body.get(section) or []:
+            if isinstance(block, dict) and "cache_control" in block:
+                fixed += 1
+
+    msg_breakpoints: list[dict[str, Any]] = []
+    for message in body.get("messages") or []:
+        content = message.get("content")
+        if isinstance(content, list):
+            msg_breakpoints.extend(
+                block for block in content if isinstance(block, dict) and "cache_control" in block
+            )
+
+    overflow = fixed + len(msg_breakpoints) - limit
+    if overflow > 0:
+        for block in msg_breakpoints[:overflow]:
+            block.pop("cache_control", None)
+        logger.debug(f"cache_control 断点超过 {limit} 个，已移除最早的 {overflow} 个消息断点")
+
+
 def _parse_response(payload: dict[str, Any], model_info: ModelInfo) -> APIResponse:
     """解析 Anthropic /messages 响应"""
     api_resp = APIResponse()
     api_resp.raw_data = payload
+
+    # Fable 5 等模型的安全分类器可能拒绝请求：HTTP 200 + stop_reason="refusal"，content 为空。
+    # 这里输出告警便于排查；上层的空回复处理会自动故障转移到列表中的下一个模型。
+    if payload.get("stop_reason") == "refusal":
+        stop_details = payload.get("stop_details") or {}
+        logger.warning(
+            f"[{model_info.name}] 请求被模型安全分类器拒绝 (stop_reason=refusal, "
+            f"category={stop_details.get('category')}), 将由空回复处理逻辑故障转移"
+        )
 
     text_parts: list[str] = []
     thinking_parts: list[str] = []
@@ -293,6 +413,10 @@ class AnthropicClient(BaseClient):
         if system_blocks:
             system_blocks[-1] = {**system_blocks[-1], "cache_control": _cache_control_payload()}
 
+        # 翻译 extra_params 中的思考/努力程度友好配置（enable_thinking / enable_adaptive_thinking / effort 等）
+        extra = dict(extra_params) if extra_params else {}
+        thinking, effort, max_tokens = _extract_thinking_options(extra, max_tokens, model_info.name)
+
         body: dict[str, Any] = {
             "model": model_info.model_identifier,
             "max_tokens": max_tokens,
@@ -301,6 +425,10 @@ class AnthropicClient(BaseClient):
         }
         if system_blocks:
             body["system"] = system_blocks
+        if thinking:
+            body["thinking"] = thinking
+        if effort:
+            body["output_config"] = {"effort": effort}
 
         if tool_options:
             tools = _convert_tools(tool_options)
@@ -309,11 +437,25 @@ class AnthropicClient(BaseClient):
                 tools[-1] = {**tools[-1], "cache_control": _cache_control_payload()}
             body["tools"] = tools
 
-        # 合并模型 extra_params（如 thinking、metadata 等）
-        if extra_params:
-            for k, v in extra_params.items():
-                if k not in body:
-                    body[k] = v
+        # 合并剩余的模型 extra_params（如 metadata、原生 thinking 字典等）
+        for k, v in extra.items():
+            if k not in body:
+                body[k] = v
+
+        # 开启思考时 Anthropic 不允许自定义 temperature（必须省略），否则会返回 400
+        body_thinking = body.get("thinking")
+        if isinstance(body_thinking, dict) and body_thinking.get("type") in ("adaptive", "enabled"):
+            if body.pop("temperature", None) is not None:
+                logger.debug(f"[{model_info.name}] 已开启思考，自动移除 temperature 参数（二者不兼容）")
+
+        # Fable 5 / Mythos 5 / Opus 4.7+ 已移除采样参数，发送会返回 400，自动剥离
+        if _model_rejects_sampling_params(model_info.model_identifier):
+            removed = [k for k in ("temperature", "top_p", "top_k") if body.pop(k, None) is not None]
+            if removed:
+                logger.debug(f"[{model_info.name}] 该模型不接受采样参数，已自动移除: {removed}")
+
+        # 控制 cache_control 断点总数不超过 API 上限
+        _enforce_breakpoint_limit(body)
 
         client = self._get_http_client()
 

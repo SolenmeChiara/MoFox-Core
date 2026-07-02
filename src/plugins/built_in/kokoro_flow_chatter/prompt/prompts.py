@@ -32,7 +32,7 @@ kfc_MAIN_PROMPT = Prompt(
 
 ## 工具信息
 {tool_info}
-
+{cache_breakpoint}
 # 你们之间最近的活动记录
 以下是你和 {user_name} 最近的互动历史，按时间顺序记录了你们的对话和你的心理活动（可能是线性叙事或结构化表格）：
 {activity_stream}
