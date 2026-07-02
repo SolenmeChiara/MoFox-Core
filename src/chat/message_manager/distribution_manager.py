@@ -651,12 +651,14 @@ class StreamLoopManager:
         if global_config is None:
             return 5.0
 
-        # 私聊快速响应
+        # 私聊：使用凑句窗口而非即时响应。收到消息后等待该窗口时长再开始处理，
+        # 让用户连发的多条消息合并进同一轮回复，避免逐条触发。
         try:
             chat_manager = get_chat_manager()
             chat_stream = await chat_manager.get_stream(stream_id)
             if chat_stream and not chat_stream.group_info:
-                return 0.5 if has_messages else 5.0
+                merge_window = getattr(global_config.chat, "private_message_merge_window", 3.0)
+                return merge_window if has_messages else 5.0
         except Exception:
             pass
 
