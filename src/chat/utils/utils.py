@@ -405,6 +405,15 @@ def recover_quoted_content(sentences: list[str], placeholder_map: dict[str, str]
         recovered_sentences.append(sentence)
     return recovered_sentences
 
+# LLM 回复分割标记（提示词要求模型插入的 [SPLIT]，匹配时大小写不敏感、容忍内部空格）
+_SPLIT_MARKER_PATTERN = re.compile(r"\s*\[\s*SPLIT\s*\]\s*", re.IGNORECASE)
+# 分割哨兵：用 Unicode 私有区字符替换 [SPLIT]，使其能安全穿过下方所有保护/清洗层。
+# [SPLIT] 本身是连续的 ASCII 片段，若不提前替换，会被 protect_special_blocks 的
+# 通用片段保护换成占位符（分割失效且标记被原样还原进最终输出），或在后面有中文时
+# 被括号清洗正则直接删除。
+_SPLIT_SENTINEL = "\ue000"
+
+
 def process_llm_response(text: str, enable_splitter: bool = True, enable_chinese_typo: bool = True) -> list[str]:
     assert global_config is not None
 
@@ -414,7 +423,13 @@ def process_llm_response(text: str, enable_splitter: bool = True, enable_chinese
         return []
 
     if not global_config.response_post_process.enable_response_post_process:
-        return [text]
+        # 后处理关闭时也不能把分割标记原样发出去
+        return [_SPLIT_MARKER_PATTERN.sub(" ", text).strip() or text]
+
+    # 必须在所有保护层之前完成标记替换（见 _SPLIT_SENTINEL 的注释）
+    llm_split_requested = bool(_SPLIT_MARKER_PATTERN.search(text))
+    if llm_split_requested:
+        text = _SPLIT_MARKER_PATTERN.sub(_SPLIT_SENTINEL, text)
 
     # --- 三层防护系统 ---
     # --- 三层防护系统 ---
@@ -432,11 +447,12 @@ def process_llm_response(text: str, enable_splitter: bool = True, enable_chinese
     _extracted_contents = pattern.findall(protected_text)
     cleaned_text = pattern.sub("", protected_text)
 
-    if cleaned_text.strip() == "":
+    if cleaned_text.replace(_SPLIT_SENTINEL, "").strip() == "":
         # 如果清理后只剩下特殊块，直接恢复并返回
         if special_blocks_mapping:
              recovered = recover_special_blocks([protected_text], special_blocks_mapping)
-             return recover_kaomoji(recovered, kaomoji_mapping)
+             recovered = recover_kaomoji(recovered, kaomoji_mapping)
+             return [s.replace(_SPLIT_SENTINEL, "") for s in recovered]
         return ["呃呃"]
 
     logger.debug(f"{text}去除括号处理后的文本: {cleaned_text}")
@@ -462,9 +478,9 @@ def process_llm_response(text: str, enable_splitter: bool = True, enable_chinese
     if global_config.response_splitter.enable and enable_splitter:
         logger.info(f"回复分割器已启用，模式: {global_config.response_splitter.split_mode}。")
 
-        if "[SPLIT]" in cleaned_text:
+        if _SPLIT_SENTINEL in cleaned_text:
             logger.debug("检测到 [SPLIT] 标记，使用 LLM 自定义分割。")
-            split_sentences_raw = cleaned_text.split("[SPLIT]")
+            split_sentences_raw = cleaned_text.split(_SPLIT_SENTINEL)
             split_sentences = [s.strip() for s in split_sentences_raw if s.strip()]
         else:
             logger.debug("使用基于标点的传统模式进行分割。")
@@ -526,6 +542,11 @@ def process_llm_response(text: str, enable_splitter: bool = True, enable_chinese
     sentences = recover_quoted_content(sentences, quote_mapping)
     if global_config.response_splitter.enable_kaomoji_protection:
         sentences = recover_kaomoji(sentences, kaomoji_mapping)
+
+    # 清理残留的分割哨兵（例如藏在引号/颜文字/代码块等受保护内容里的 [SPLIT]）
+    if llm_split_requested:
+        sentences = [s.replace(_SPLIT_SENTINEL, "") for s in sentences]
+        sentences = [s for s in sentences if s.strip()]
 
     return sentences
 
@@ -953,6 +974,12 @@ def filter_system_format_content(content: str | None) -> str:
     original_content = content
     cleaned_content = content.strip()
 
+    # 保护回复分割标记：[SPLIT] 也是方括号格式，会被下方的 [...] 清理正则误删
+    # （也会干扰 [回复...] 的 rfind 截断），先换成哨兵，过滤完成后再还原
+    has_split_marker = bool(_SPLIT_MARKER_PATTERN.search(cleaned_content))
+    if has_split_marker:
+        cleaned_content = _SPLIT_MARKER_PATTERN.sub(_SPLIT_SENTINEL, cleaned_content)
+
     # 核心逻辑：优先处理最复杂的[回复...]格式，特别是嵌套格式。
     # 这种方法最稳健：如果以[回复开头，就找到最后一个]，然后切掉之前的所有内容。
     if cleaned_content.startswith("[回复"):
@@ -968,6 +995,10 @@ def filter_system_format_content(content: str | None) -> str:
 
     # 移除@格式：@<xxx>
     cleaned_content = re.sub(r"@<[^>]*>", "", cleaned_content)
+
+    # 还原分割标记，交由后续的 process_llm_response 处理分割
+    if has_split_marker:
+        cleaned_content = cleaned_content.replace(_SPLIT_SENTINEL, "[SPLIT]")
 
     # 记录过滤操作
     if cleaned_content != original_content.strip():
