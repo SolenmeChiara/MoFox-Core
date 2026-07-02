@@ -182,6 +182,9 @@ allow_reply_interruption = false # 是否允许在正在生成回复时打断（
 interruption_max_limit = 5 # 每个聊天流的最大打断次数
 interruption_min_probability = 0.05 # 最低打断概率（反比例函数趋近的下限值）
 
+# 私聊凑句窗口
+private_message_merge_window = 3.0 # 私聊收到消息后等待该时长（秒）再开始处理，期间连发的消息合并为一轮回复；改回0.5即恢复旧版逐条即时响应
+
 # 动态消息分发系统配置
 dynamic_distribution_enabled = true # 是否启用动态消息分发周期调整
 dynamic_distribution_base_interval = 5.0 # 基础分发间隔（秒）
@@ -227,11 +230,12 @@ enable_tool = true # 是否在普通聊天中启用工具
 
 [mood]
 enable_mood = true # 是否启用情绪系统
-mood_update_threshold = 1 # 情绪更新阈值,越高，更新越慢
+mood_update_threshold = 1 # 情绪更新概率乘数：越大更新越【快】。1=活跃期最高约40%概率/条消息，0.5=减半
 
 [emoji]
 emoji_chance = 0.6 # MoFox-Bot激活表情包动作的概率
 emoji_activate_type = "llm" # 表情包激活类型，可选：random，llm ; random下，表情包动作随机启用，llm下，表情包动作根据llm判断是否启用
+gif_native_upload = false # GIF动图以原格式直传给Gemini直连模型（能完整感知动画过程），关闭则按旧策略截取4帧PNG
 
 max_reg_num = 60 # 表情包最大注册数量
 do_replace = true # 开启则在达到最大数量时删除（替换）表情包，关闭则达到最大数量时不会继续收集表情包
@@ -468,7 +472,8 @@ completion_threshold = 3 # 一个月度计划被使用多少次后算作完成
 
 [video_analysis] # 视频分析配置
 enable = true # 是否启用视频分析功能
-analysis_mode = "batch_frames" # 分析模式："frame_by_frame"（逐帧分析，非常慢）、"batch_frames"（批量分析，推荐）或 "auto"（自动选择）
+analysis_mode = "batch_frames" # 分析模式："batch_frames"（抽帧批量分析，推荐）、"frame_by_frame"（逐帧分析，非常慢）、"auto"（自动选择）或 "gemini_direct"（视频直传Gemini，含音轨理解，需utils_video任务配置Google直连模型，失败自动回退抽帧）
+direct_low_resolution = false # 视频直传时使用低媒体分辨率：约100 token/秒（标准约300 token/秒），仅 gemini_direct 模式生效
 frame_extraction_mode = "keyframe"  # 抽帧模式: "keyframe" (智能关键帧，推荐)、"fixed_number" (固定总帧数) 或 "time_interval" (按时间间隔)
 frame_interval_seconds = 2.0  # 按时间间隔抽帧的秒数（仅在 mode = "time_interval" 时生效）
 max_frames = 16 # 最大分析帧数

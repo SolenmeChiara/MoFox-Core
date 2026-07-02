@@ -30,6 +30,15 @@ max_retry = 2
 timeout = 30
 retry_interval = 10
 
+#[[api_providers]] # Anthropic Claude 原生API配置示例（取消注释以启用）
+#name = "Claude"
+#base_url = "https://api.anthropic.com/v1"
+#api_key = "sk-ant-your-api-key-here"
+#client_type = "anthropic"  # 使用原生 anthropic 客户端，自动启用 prompt caching（缓存命中会输出到日志）
+#max_retry = 2
+#timeout = 60
+#retry_interval = 10
+
 #[[api_providers]] # AWS Bedrock配置示例 - 方式1：IAM凭证模式（取消注释以启用）
 #name = "AWS_Bedrock"
 #base_url = ""  # Bedrock不需要base_url，留空即可
@@ -146,6 +155,24 @@ price_out = 0.0
 # 思考配置（二选一，不能同时使用，否则会返回 400 错误）：
 #thinking_level = "medium"     # Gemini3新版参数，可选值: "low", "medium", "high"
 thinking_budget = 256       # Gemini2.5系列旧版参数，不同模型范围不同（如 gemini-2.5-flash: 1-24576, gemini-2.5-pro: 128-32768）
+
+#[[models]] # Anthropic Claude 配置示例（取消注释以启用，需配合上面的 Claude api_provider）
+#model_identifier = "claude-opus-4-6"
+#name = "claude-opus-4.6"
+#api_provider = "Claude"
+#price_in = 36.0    # ¥36.0/M tokens ($5/M tokens)
+#price_out = 180.0  # ¥180.0/M tokens ($25/M tokens)
+#[models.extra_params]
+## ---- Anthropic 思考与努力程度配置（仅 client_type="anthropic" 时生效）----
+## 注意：enable_adaptive_thinking 与 enable_thinking 在 Anthropic API 层面【互斥】，
+## 两者同时开启时优先使用自适应思考（enable_adaptive_thinking）并在日志中告警。
+## 开启任意一种思考后：
+##   1. 思考 token 会计入任务的 max_tokens，请确保 max_tokens 足够大（建议 >= 2000）；
+##   2. Anthropic 不允许思考与 temperature 同时设置，客户端会自动移除 temperature。
+#enable_adaptive_thinking = true  # 自适应思考：模型自行决定何时思考、思考多少（Claude Opus 4.6 / Sonnet 4.6 及更新模型，官方推荐）
+#enable_thinking = false          # 传统扩展思考：固定思考预算（旧模型使用，Claude 4.6 上已弃用）
+#thinking_budget = 2048           # 扩展思考的 token 预算，仅 enable_thinking=true 时生效（最小 1024，必须小于 max_tokens，不足时客户端会自动扩容 max_tokens）
+#effort = "high"                  # 努力程度：low / medium / high / xhigh / max（不配置时 API 默认为 high；越低输出越精简、成本越低）
 
 #[[models]] # AWS Bedrock - Claude 3.5 Sonnet配置示例（取消注释以启用）
 #model_identifier = "us.anthropic.claude-3-5-sonnet-20240620-v1:0"  # 跨区推理配置文件

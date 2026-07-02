@@ -166,6 +166,11 @@ class ChatConfig(ValidatedConfigBase):
         default=0.1, ge=0.0, le=1.0, description="最低打断概率（即使达到较高打断次数，也保证有此概率的打断机会）"
     )
 
+    # 私聊凑句窗口：收到消息后等待该时长再开始处理，期间用户连发的消息会被合并进同一轮回复，
+    # 避免"发几条就触发几次回复"。设为0.5可恢复旧版的即时响应行为。
+    private_message_merge_window: float = Field(
+        default=3.0, ge=0.1, le=30.0, description="私聊消息凑句窗口（秒），期间连发的消息会合并为一轮处理"
+    )
     # 动态消息分发系统配置
     dynamic_distribution_enabled: bool = Field(default=True, description="是否启用动态消息分发周期调整")
     dynamic_distribution_base_interval: float = Field(default=5.0, ge=1.0, le=60.0, description="基础分发间隔（秒）")
@@ -339,6 +344,10 @@ class EmojiConfig(ValidatedConfigBase):
     enable_emotion_analysis: bool = Field(default=True, description="启用情感分析")
     emoji_selection_mode: Literal["emotion", "description"] = Field(default="emotion", description="表情选择模式")
     max_context_emojis: int = Field(default=30, description="每次随机传递给LLM的表情包最大数量，0为全部")
+    gif_native_upload: bool = Field(
+        default=False,
+        description="GIF动图以原格式直传给Gemini直连模型（能完整感知动画），关闭则按旧策略截取4帧PNG",
+    )
 
 
 class MemoryConfig(ValidatedConfigBase):
@@ -536,7 +545,7 @@ class MoodConfig(ValidatedConfigBase):
     """情绪配置类"""
 
     enable_mood: bool = Field(default=False, description="启用情绪")
-    mood_update_threshold: float = Field(default=1.0, description="情绪更新阈值")
+    mood_update_threshold: float = Field(default=1.0, description="情绪更新概率乘数，越大更新越快（作为更新概率的乘数参与计算）")
 
 
 class ReactionRuleConfig(ValidatedConfigBase):
@@ -703,7 +712,14 @@ class VideoAnalysisConfig(ValidatedConfigBase):
     """视频分析配置类"""
 
     enable: bool = Field(default=True, description="启用")
-    analysis_mode: str = Field(default="batch_frames", description="分析模式")
+    analysis_mode: str = Field(
+        default="batch_frames",
+        description="分析模式：batch_frames(抽帧批量)、frame_by_frame(逐帧)、auto(自动)、gemini_direct(视频直传Gemini，失败自动回退抽帧)",
+    )
+    direct_low_resolution: bool = Field(
+        default=False,
+        description="视频直传时使用低媒体分辨率（约100 token/秒，标准约300 token/秒），仅 gemini_direct 模式生效",
+    )
     frame_extraction_mode: str = Field(
         default="keyframe", description="抽帧模式：keyframe(关键帧), fixed_number(固定数量), time_interval(时间间隔)"
     )
