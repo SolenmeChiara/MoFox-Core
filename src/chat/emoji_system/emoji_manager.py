@@ -701,11 +701,17 @@ class EmojiManager:
 
                 image_data_for_vlm, image_format_for_vlm = image_base64, image_format
                 if image_format in ["gif", "GIF"]:
-                    image_base64_frames = get_image_manager().transform_gif(image_base64)
-                    if not image_base64_frames:
-                        raise RuntimeError("GIF表情包转换失败")
-                    image_data_for_vlm, image_format_for_vlm = image_base64_frames, "jpeg"
-                    prompt = "这是一个GIF动图表情包的关键帧。" + prompt
+                    if global_config.emoji.gif_native_upload:
+                        # GIF原格式直传：下游会按所选模型的能力表决定原样发送（Gemini直连可
+                        # 完整感知动画）还是自动切成4帧PNG（不支持gif的模型）
+                        image_data_for_vlm, image_format_for_vlm = image_base64, "gif"
+                        prompt = "这是一个GIF动图表情包，请观察完整的动画过程。" + prompt
+                    else:
+                        image_base64_frames = get_image_manager().transform_gif(image_base64)
+                        if not image_base64_frames:
+                            raise RuntimeError("GIF表情包转换失败")
+                        image_data_for_vlm, image_format_for_vlm = image_base64_frames, "jpeg"
+                        prompt = "这是一个GIF动图表情包的关键帧。" + prompt
 
                 for i in range(3):
                     try:

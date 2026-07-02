@@ -1,5 +1,7 @@
 import asyncio
+import base64
 import io
+import math
 from collections.abc import Callable, Coroutine
 from typing import Any
 
@@ -35,11 +37,24 @@ THINKING_BUDGET_AUTO = -1  # 自动调整思考预算,由模型决定
 THINKING_BUDGET_DISABLED = 0  # 禁用思考预算(如果模型允许禁用)
 
 # 新版 thinking_level 参数
-# 支持的思考等级
+# 支持的思考等级（"minimal" 为 Gemini 3.5 系列新增；3.5 默认等级为 medium）
+THINKING_LEVEL_MINIMAL = "minimal"
 THINKING_LEVEL_LOW = "low"
 THINKING_LEVEL_MEDIUM = "medium"
 THINKING_LEVEL_HIGH = "high"
-VALID_THINKING_LEVELS = [THINKING_LEVEL_LOW, THINKING_LEVEL_MEDIUM, THINKING_LEVEL_HIGH]
+VALID_THINKING_LEVELS = [THINKING_LEVEL_MINIMAL, THINKING_LEVEL_LOW, THINKING_LEVEL_MEDIUM, THINKING_LEVEL_HIGH]
+
+# Gemini 3.5 起官方弃用采样参数（temperature/topP/topK），强烈建议不要发送
+_NO_SAMPLING_MODEL_PREFIXES = ("gemini-3.5",)
+
+# 视频直传：inline_data 整个请求上限 20MB，base64 会膨胀约33%，原始视频取 14MB 以内走内联，
+# 超过则走 Files API（免费层存储上限 2GB，文件 48 小时后自动清理）
+VIDEO_INLINE_LIMIT_BYTES = 14 * 1024 * 1024
+
+
+def _model_rejects_sampling_params(model_identifier: str) -> bool:
+    """判断模型是否不应发送 temperature/topP/topK（Gemini 3.5 及以后）"""
+    return model_identifier.startswith(_NO_SAMPLING_MODEL_PREFIXES)
 
 gemini_safe_settings = [
     {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
@@ -48,6 +63,16 @@ gemini_safe_settings = [
     {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
     {"category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": "BLOCK_NONE"},
 ]
+
+
+def _l2_normalize(vector: list[float]) -> list[float]:
+    """对向量做 L2 归一化（已归一化的向量重复归一化无害）"""
+    if not vector:
+        return vector
+    norm = math.sqrt(sum(x * x for x in vector))
+    if norm <= 0:
+        return vector
+    return [x / norm for x in vector]
 
 
 def _format_to_mime_type(image_format: str) -> str:
@@ -172,6 +197,7 @@ def _build_generation_config(
     thinking_level: str | None = None,
     response_format: RespFormat | None = None,
     extra_params: dict | None = None,
+    model_identifier: str = "",
 ) -> dict:
     """
     构建并返回 Gemini API 的 `generationConfig` 字典。
@@ -193,12 +219,12 @@ def _build_generation_config(
     Returns:
         一个包含完整 `generationConfig` 的字典。
     """
-    config = {
-        "maxOutputTokens": max_tokens,
-        "temperature": temperature,
-        "topK": 1,
-        "topP": 1,
-    }
+    config: dict[str, Any] = {"maxOutputTokens": max_tokens}
+    # Gemini 3.5 起官方弃用采样参数，发送虽不报错但强烈不建议；旧模型保持原有行为
+    if not _model_rejects_sampling_params(model_identifier):
+        config["temperature"] = temperature
+        config["topK"] = 1
+        config["topP"] = 1
 
     # 处理思考配置 - 新版 thinking_level 优先于旧版 thinking_budget
     if thinking_level is not None:
@@ -269,19 +295,21 @@ class AiohttpGeminiStreamParser:
             if chunk_data.get("candidates"):
                 candidate = chunk_data["candidates"][0]
 
-                # 解析内容
+                # 解析内容（functionCall 与 thought 都挂在 content.parts 的各 part 上）
                 if "content" in candidate and "parts" in candidate["content"]:
                     for part in candidate["content"]["parts"]:
-                        if "text" in part:
-                            self.content_buffer.write(part["text"])
-
-                # 解析工具调用
-                if "functionCall" in candidate:
-                    func_call = candidate["functionCall"]
-                    call_id = f"gemini_call_{len(self.tool_calls_buffer)}"
-                    self.tool_calls_buffer.append(
-                        {"id": call_id, "name": func_call.get("name", ""), "args": func_call.get("args", {})}
-                    )
+                        if part.get("functionCall"):
+                            func_call = part["functionCall"]
+                            call_id = f"gemini_call_{len(self.tool_calls_buffer)}"
+                            self.tool_calls_buffer.append(
+                                {"id": call_id, "name": func_call.get("name", ""), "args": func_call.get("args", {})}
+                            )
+                        elif "text" in part:
+                            # 带 thought 标记的 part 是思考内容，不能混进正文
+                            if part.get("thought"):
+                                self.reasoning_buffer.write(part["text"])
+                            else:
+                                self.content_buffer.write(part["text"])
 
             # 解析使用统计
             if "usageMetadata" in chunk_data:
@@ -392,19 +420,30 @@ def _default_normal_response_parser(
         if response_data.get("candidates"):
             candidate = response_data["candidates"][0]
 
-            # 解析文本内容
+            # 解析内容（functionCall 与 thought 都挂在 content.parts 的各 part 上）
             if "content" in candidate and "parts" in candidate["content"]:
-                content_parts = [part["text"] for part in candidate["content"]["parts"] if "text" in part]
+                content_parts: list[str] = []
+                reasoning_parts: list[str] = []
+                tool_calls: list[ToolCall] = []
+                for part in candidate["content"]["parts"]:
+                    if part.get("functionCall"):
+                        func_call = part["functionCall"]
+                        tool_calls.append(
+                            ToolCall(f"gemini_call_{len(tool_calls)}", func_call.get("name", ""), func_call.get("args", {}))
+                        )
+                    elif "text" in part:
+                        # 带 thought 标记的 part 是思考内容，不能混进正文
+                        if part.get("thought"):
+                            reasoning_parts.append(part["text"])
+                        else:
+                            content_parts.append(part["text"])
 
                 if content_parts:
                     api_response.content = "".join(content_parts)
-
-            # 解析工具调用
-            if "functionCall" in candidate:
-                func_call = candidate["functionCall"]
-                api_response.tool_calls = [
-                    ToolCall("gemini_call_0", func_call.get("name", ""), func_call.get("args", {}))
-                ]
+                if reasoning_parts:
+                    api_response.reasoning_content = "".join(reasoning_parts)
+                if tool_calls:
+                    api_response.tool_calls = tool_calls
 
         # 解析使用统计
         usage_record = None
@@ -485,29 +524,22 @@ class AiohttpGeminiClient(BaseClient):
 
     # 移除全局 session，全部请求都用 with aiohttp.ClientSession() as session:
 
-    async def _make_request(
-        self, method: str, endpoint: str, data: dict | None = None, stream: bool = False
-    ) -> aiohttp.ClientResponse:
+    def _session_headers(self) -> dict[str, str]:
+        return {
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/81.0.4044.113 Safari/537.36",
+        }
+
+    async def _request_json(self, method: str, endpoint: str, data: dict | None = None) -> dict:
         """
-        向 Gemini API 发起一个 HTTP 请求，并增加了重试逻辑。
+        发起非流式请求并返回已解析的 JSON 数据。
 
-        此方法封装了 aiohttp 的请求逻辑，包括 URL 构建、认证、超时和错误处理。
-        - 对于网络连接相关的 `aiohttp.ClientError`，它会最多重试3次。
-        - 对于 HTTP 状态码错误（如 4xx, 5xx），它会立即失败，不会重试。
-        为了健壮性，它在每次调用时都会创建一个新的 aiohttp.ClientSession。
+        关键：响应体必须在 ClientSession 的作用域【内】读完。
+        旧实现把 response 对象返回到 with 块外再读 body，此时 session 已关闭、
+        连接已被回收，读取会挂起或报错——这就是旧版"Gemini 客户端超时"的根源。
 
-        Args:
-            method: HTTP 请求方法 (例如, "POST")。
-            endpoint: API 的目标端点 (例如, "models/gemini-pro:generateContent")。
-            data: 要作为 JSON 发送到请求体的数据。
-            stream: 如果为 True，则请求一个流式响应。
-
-        Returns:
-            一个 aiohttp.ClientResponse 对象。
-
-        Raises:
-            RespNotOkException: 如果 HTTP 响应状态码表示错误。
-            NetworkConnectionError: 如果在所有重试尝试后仍然发生 aiohttp 客户端错误。
+        - 网络层 `aiohttp.ClientError` 最多重试3次；
+        - HTTP 状态码错误（4xx/5xx）立即失败，不重试。
         """
         api_key = self.api_provider.get_api_key()
         url = f"{self.base_url}/{endpoint}?key={api_key}"
@@ -515,35 +547,70 @@ class AiohttpGeminiClient(BaseClient):
         max_retries = 3
         last_exception = None
 
-        for attempt in range(max_retries):
+        for _attempt in range(max_retries):
             try:
                 async with aiohttp.ClientSession(
-                    timeout=aiohttp.ClientTimeout(total=300),
-                    headers={
-                        "Content-Type": "application/json",
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/81.0.4044.113 Safari/537.36",
-                    },
+                    timeout=aiohttp.ClientTimeout(total=max(self.api_provider.timeout, 30)),
+                    headers=self._session_headers(),
                 ) as session:
                     if method.upper() == "POST":
-                        response = await session.post(
-                            url, json=data, headers={"Accept": "text/event-stream" if stream else "application/json"}
-                        )
+                        response = await session.post(url, json=data, headers={"Accept": "application/json"})
                     else:
                         response = await session.get(url)
 
-                    # 检查HTTP状态码 - 如果是错误，立即失败，不重试
                     if response.status >= 400:
                         error_text = await response.text()
                         raise RespNotOkException(response.status, error_text)
 
-                    # 成功，返回响应
-                    return response
+                    # 在 session 作用域内读完并解析 body
+                    return await response.json()
 
             except aiohttp.ClientError as e:
                 last_exception = e
                 await asyncio.sleep(1)  # 等待1秒后重试
 
-        # 如果所有重试都失败了
+        raise NetworkConnectionError() from last_exception
+
+    async def _request_stream(
+        self,
+        endpoint: str,
+        data: dict,
+        stream_response_handler: Callable[
+            [aiohttp.ClientResponse, asyncio.Event | None],
+            Coroutine[Any, Any, tuple[APIResponse, tuple[int, int, int] | None]],
+        ],
+        interrupt_flag: asyncio.Event | None,
+    ) -> tuple[APIResponse, tuple[int, int, int] | None]:
+        """
+        发起流式请求，并在 ClientSession 的作用域【内】完成整个流的消费。
+
+        与 _request_json 同理：流必须在 session 存活期间读完，不能把 response 带出 with 块。
+        """
+        api_key = self.api_provider.get_api_key()
+        url = f"{self.base_url}/{endpoint}?key={api_key}"
+
+        max_retries = 3
+        last_exception = None
+
+        for _attempt in range(max_retries):
+            try:
+                async with aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=300),
+                    headers=self._session_headers(),
+                ) as session:
+                    response = await session.post(url, json=data, headers={"Accept": "text/event-stream"})
+
+                    if response.status >= 400:
+                        error_text = await response.text()
+                        raise RespNotOkException(response.status, error_text)
+
+                    # 在 session 作用域内消费完整个流
+                    return await stream_response_handler(response, interrupt_flag)
+
+            except aiohttp.ClientError as e:
+                last_exception = e
+                await asyncio.sleep(1)
+
         raise NetworkConnectionError() from last_exception
 
     async def get_response(
@@ -628,7 +695,8 @@ class AiohttpGeminiClient(BaseClient):
                 thinking_budget=thinking_budget,
                 thinking_level=thinking_level,
                 response_format=response_format,
-                extra_params=extra_params
+                extra_params=extra_params,
+                model_identifier=model_info.model_identifier,
             ),
             "safetySettings": gemini_safe_settings,
         }
@@ -643,9 +711,11 @@ class AiohttpGeminiClient(BaseClient):
 
         try:
             if model_info.force_stream_mode:
-                # 流式请求
+                # 流式请求（整个流在 _request_stream 的 session 作用域内消费）
                 endpoint = f"models/{model_info.model_identifier}:streamGenerateContent"
-                req_task = asyncio.create_task(self._make_request("POST", endpoint, request_data, stream=True))
+                req_task = asyncio.create_task(
+                    self._request_stream(endpoint, request_data, stream_response_handler, interrupt_flag)
+                )
 
                 while not req_task.done():
                     if interrupt_flag and interrupt_flag.is_set():
@@ -653,13 +723,12 @@ class AiohttpGeminiClient(BaseClient):
                         raise ReqAbortException("请求被外部信号中断")
                     await asyncio.sleep(0.1)
 
-                response = req_task.result()
-                api_response, usage_record = await stream_response_handler(response, interrupt_flag)
+                api_response, usage_record = req_task.result()
 
             else:
-                # 普通请求
+                # 普通请求（JSON 在 _request_json 的 session 作用域内解析完成）
                 endpoint = f"models/{model_info.model_identifier}:generateContent"
-                req_task = asyncio.create_task(self._make_request("POST", endpoint, request_data))
+                req_task = asyncio.create_task(self._request_json("POST", endpoint, request_data))
 
                 while not req_task.done():
                     if interrupt_flag and interrupt_flag.is_set():
@@ -667,9 +736,16 @@ class AiohttpGeminiClient(BaseClient):
                         raise ReqAbortException("请求被外部信号中断")
                     await asyncio.sleep(0.1)
 
-                response = req_task.result()
-                response_data = await response.json()
+                response_data = req_task.result()
                 api_response, usage_record = async_response_parser(response_data)
+
+                # 截断检测：Gemini 的思考 token 计入 maxOutputTokens，思考过多会挤掉可见输出
+                _candidates = response_data.get("candidates") or []
+                if _candidates and _candidates[0].get("finishReason") == "MAX_TOKENS":
+                    logger.warning(
+                        f"[{model_info.name}] 输出被 maxOutputTokens 截断（思考token也计入上限），"
+                        f"建议调大 max_tokens 或将 thinking_level 调低"
+                    )
 
         except (ReqAbortException, NetworkConnectionError, RespNotOkException, RespParseException):
             # 直接重抛项目定义的异常
@@ -691,6 +767,169 @@ class AiohttpGeminiClient(BaseClient):
 
         return api_response
 
+    # ---- 视频直传理解 ----
+
+    def _upload_base_url(self) -> str:
+        """推导 Files API 的上传端点根路径（…/upload/v1beta）"""
+        root = self.base_url
+        if root.endswith("/v1beta"):
+            root = root[: -len("/v1beta")]
+        return f"{root}/upload/v1beta"
+
+    async def _upload_file_and_wait_active(
+        self, data: bytes, mime_type: str, display_name: str = "mofox_video"
+    ) -> tuple[str, str]:
+        """通过 Files API 上传文件并等待其变为 ACTIVE 状态。
+
+        使用官方的 resumable 协议：start 拿到上传URL → 一次性 upload+finalize → 轮询状态。
+
+        Returns:
+            (file_uri, file_name)：生成请求里用 uri，删除时用 name（形如 files/abc123）
+        """
+        api_key = self.api_provider.get_api_key()
+        start_url = f"{self._upload_base_url()}/files?key={api_key}"
+
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=600),
+            headers=self._session_headers(),
+        ) as session:
+            # 第一步：发起 resumable 上传，拿到上传 URL
+            start_resp = await session.post(
+                start_url,
+                json={"file": {"display_name": display_name}},
+                headers={
+                    "X-Goog-Upload-Protocol": "resumable",
+                    "X-Goog-Upload-Command": "start",
+                    "X-Goog-Upload-Header-Content-Length": str(len(data)),
+                    "X-Goog-Upload-Header-Content-Type": mime_type,
+                },
+            )
+            if start_resp.status >= 400:
+                raise RespNotOkException(start_resp.status, await start_resp.text())
+            upload_url = start_resp.headers.get("X-Goog-Upload-URL")
+            if not upload_url:
+                raise RespParseException(None, "Files API 未返回上传URL（X-Goog-Upload-URL）")
+
+            # 第二步：上传全部字节并 finalize
+            upload_resp = await session.post(
+                upload_url,
+                data=data,
+                headers={
+                    "Content-Length": str(len(data)),
+                    "X-Goog-Upload-Offset": "0",
+                    "X-Goog-Upload-Command": "upload, finalize",
+                },
+            )
+            if upload_resp.status >= 400:
+                raise RespNotOkException(upload_resp.status, await upload_resp.text())
+            file_info = (await upload_resp.json()).get("file") or {}
+            file_uri = file_info.get("uri", "")
+            file_name = file_info.get("name", "")
+            state = file_info.get("state", "")
+            if not file_uri or not file_name:
+                raise RespParseException(None, f"Files API 上传响应缺少 uri/name: {file_info}")
+
+            # 第三步：等待视频处理完成（PROCESSING → ACTIVE）
+            poll_url = f"{self.base_url}/{file_name}?key={api_key}"
+            waited = 0.0
+            while state == "PROCESSING" and waited < 180:
+                await asyncio.sleep(2.0)
+                waited += 2.0
+                poll_resp = await session.get(poll_url)
+                if poll_resp.status >= 400:
+                    raise RespNotOkException(poll_resp.status, await poll_resp.text())
+                file_info = await poll_resp.json()
+                state = file_info.get("state", "")
+
+            if state != "ACTIVE":
+                raise RespParseException(None, f"Files API 文件未就绪（state={state}）")
+
+            return file_uri, file_name
+
+    async def _delete_file(self, file_name: str) -> None:
+        """删除 Files API 上的文件（尽力而为，失败不抛出——文件48小时后也会自动清理）"""
+        try:
+            api_key = self.api_provider.get_api_key()
+            url = f"{self.base_url}/{file_name}?key={api_key}"
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=30),
+                headers=self._session_headers(),
+            ) as session:
+                await session.delete(url)
+        except Exception as e:
+            logger.debug(f"删除 Files API 文件失败（将自动过期清理）: {e}")
+
+    async def get_video_response(
+        self,
+        model_info: ModelInfo,
+        prompt: str,
+        video_bytes: bytes,
+        mime_type: str = "video/mp4",
+        max_tokens: int = 2048,
+        low_resolution: bool = False,
+        extra_params: dict[str, Any] | None = None,
+    ) -> APIResponse:
+        """视频直传理解：把整个视频（含音轨）直接交给 Gemini 分析。
+
+        - 小视频（<= 14MB）走 inline_data，单次请求完成
+        - 大视频走 Files API：上传 → 等待 ACTIVE → 生成 → 尽力删除
+        - low_resolution=True 时使用低媒体分辨率（约100 token/秒 vs 标准约300 token/秒）
+        """
+        uploaded_file_name: str | None = None
+        if len(video_bytes) <= VIDEO_INLINE_LIMIT_BYTES:
+            video_part: dict[str, Any] = {
+                "inline_data": {"mime_type": mime_type, "data": base64.b64encode(video_bytes).decode()}
+            }
+        else:
+            logger.info(
+                f"视频大小 {len(video_bytes) / 1024 / 1024:.1f}MB 超过内联上限，走 Files API 上传"
+            )
+            file_uri, uploaded_file_name = await self._upload_file_and_wait_active(video_bytes, mime_type)
+            video_part = {"file_data": {"mime_type": mime_type, "file_uri": file_uri}}
+
+        generation_config = _build_generation_config(
+            max_tokens,
+            0.3,
+            response_format=None,
+            extra_params=extra_params,
+            model_identifier=model_info.model_identifier,
+        )
+        if low_resolution:
+            generation_config["mediaResolution"] = "MEDIA_RESOLUTION_LOW"
+
+        request_data = {
+            "contents": [{"role": "user", "parts": [video_part, {"text": prompt}]}],
+            "generationConfig": generation_config,
+            "safetySettings": gemini_safe_settings,
+        }
+
+        try:
+            endpoint = f"models/{model_info.model_identifier}:generateContent"
+            response_data = await self._request_json("POST", endpoint, request_data)
+            api_response, usage_record = _default_normal_response_parser(response_data)
+
+            # 截断检测：Gemini 的思考 token 计入 maxOutputTokens，思考太多会把可见输出挤掉
+            candidates = response_data.get("candidates") or []
+            finish_reason = candidates[0].get("finishReason") if candidates else None
+            if finish_reason == "MAX_TOKENS":
+                logger.warning(
+                    f"[{model_info.name}] 视频分析输出被 maxOutputTokens 截断"
+                    f"（思考token也计入上限），建议调大 max_tokens 或将 thinking_level 调低至 minimal"
+                )
+
+            if usage_record:
+                api_response.usage = UsageRecord(
+                    model_name=model_info.name,
+                    provider_name=model_info.api_provider,
+                    prompt_tokens=usage_record[0],
+                    completion_tokens=usage_record[1],
+                    total_tokens=usage_record[2],
+                )
+            return api_response
+        finally:
+            if uploaded_file_name:
+                await self._delete_file(uploaded_file_name)
+
     async def get_embedding(
         self,
         model_info: ModelInfo,
@@ -698,9 +937,39 @@ class AiohttpGeminiClient(BaseClient):
         extra_params: dict[str, Any] | None = None,
     ) -> APIResponse:
         """
-        获取文本嵌入 - 此客户端不支持嵌入功能
+        获取文本嵌入（gemini-embedding-2 / gemini-embedding-001）。
+
+        - 单条输入走 :embedContent，批量输入走 :batchEmbedContents
+        - 维度通过模型的 extra_params 中的 output_dimensionality 控制（128-3072，默认3072）
+        - 截断维度后做一次 L2 归一化（embedding-2 服务端会归一化，001 不会；重复归一化无害）
         """
-        raise NotImplementedError("AioHTTP Gemini客户端不支持文本嵌入功能")
+        extra = dict(extra_params) if extra_params else {}
+        output_dim = extra.get("output_dimensionality") or extra.get("outputDimensionality")
+        model_path = f"models/{model_info.model_identifier}"
+
+        if isinstance(embedding_input, list):
+            requests_payload = []
+            for text in embedding_input:
+                item: dict[str, Any] = {"model": model_path, "content": {"parts": [{"text": text}]}}
+                if output_dim:
+                    item["outputDimensionality"] = int(output_dim)
+                requests_payload.append(item)
+            endpoint = f"models/{model_info.model_identifier}:batchEmbedContents"
+            response_data = await self._request_json("POST", endpoint, {"requests": requests_payload})
+            vectors = [emb.get("values", []) for emb in response_data.get("embeddings", [])]
+            embedding_result: list[list[float]] | list[float] = [_l2_normalize(v) for v in vectors]
+        else:
+            payload: dict[str, Any] = {"content": {"parts": [{"text": embedding_input}]}}
+            if output_dim:
+                payload["outputDimensionality"] = int(output_dim)
+            endpoint = f"models/{model_info.model_identifier}:embedContent"
+            response_data = await self._request_json("POST", endpoint, payload)
+            embedding_result = _l2_normalize((response_data.get("embedding") or {}).get("values", []))
+
+        api_response = APIResponse()
+        api_response.embedding = embedding_result
+        api_response.raw_data = response_data
+        return api_response
 
     async def get_audio_transcriptions(
         self,
@@ -748,15 +1017,15 @@ class AiohttpGeminiClient(BaseClient):
                 thinking_budget=THINKING_BUDGET_AUTO,
                 thinking_level=None,
                 response_format=None,
-                extra_params=extra_params
+                extra_params=extra_params,
+                model_identifier=model_info.model_identifier,
             ),
             "safetySettings": gemini_safe_settings,
         }
 
         try:
             endpoint = f"models/{model_info.model_identifier}:generateContent"
-            response = await self._make_request("POST", endpoint, request_data)
-            response_data = await response.json()
+            response_data = await self._request_json("POST", endpoint, request_data)
 
             api_response, usage_record = _default_normal_response_parser(response_data)
 
@@ -779,7 +1048,18 @@ class AiohttpGeminiClient(BaseClient):
     def get_support_image_formats(self) -> list[str]:
         """
         获取支持的图片格式
+
+        gif 默认不在列表中（MessageBuilder 会将其切成最多4帧PNG）；
+        开启 [emoji].gif_native_upload 后 gif 以原格式直传，Gemini 能完整感知动画。
         """
-        return ["png", "jpg", "jpeg", "webp", "heic", "heif"]
+        formats = ["png", "jpg", "jpeg", "webp", "heic", "heif"]
+        try:
+            from src.config.config import global_config
+
+            if global_config and getattr(global_config.emoji, "gif_native_upload", False):
+                formats.append("gif")
+        except Exception:
+            pass
+        return formats
 
     # 移除 __aenter__、__aexit__、__del__，不再持有全局 session

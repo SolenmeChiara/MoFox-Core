@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from PIL import Image
+from sqlalchemy import select
 
 from src.common.database.core import get_db_session
 from src.common.database.core.models import Videos
@@ -55,6 +56,7 @@ class VideoAnalyzer:
         self.threads: int = getattr(cfg, "rust_threads", 0)
         self.ffmpeg_path: str = getattr(cfg, "ffmpeg_path", "ffmpeg")
         self.analysis_mode: str = getattr(cfg, "analysis_mode", "auto")
+        self.direct_low_resolution: bool = getattr(cfg, "direct_low_resolution", False)
         self.frame_analysis_delay: float = 0.3
 
         # 人格与提示模板
@@ -170,14 +172,98 @@ class VideoAnalyzer:
         except Exception:  # pragma: no cover
             return "\n".join(results)
 
+    # ---- Gemini 视频直传 ----
+    def _find_gemini_direct_model(self):
+        """从视频分析任务的模型列表中找到第一个走 aiohttp_gemini 客户端的模型。
+
+        Returns:
+            (ModelInfo, AiohttpGeminiClient) 或 (None, None)
+        """
+        try:
+            assert model_config is not None
+            task = model_config.model_task_config.video_analysis
+            for model_name in task.model_list:
+                mi = model_config.models_dict.get(model_name)
+                if not mi:
+                    continue
+                provider = model_config.api_providers_dict.get(mi.api_provider)
+                if provider and provider.client_type == "aiohttp_gemini":
+                    from src.llm_models.model_client.aiohttp_gemini_client import AiohttpGeminiClient
+
+                    return mi, AiohttpGeminiClient(provider)
+        except Exception as e:
+            logger.warning(f"查找视频直传模型失败: {e}")
+        return None, None
+
+    async def _analyze_direct(self, video_bytes: bytes, question: str | None) -> str:
+        """视频直传分析：整个视频（含音轨）直接交给 Gemini，不抽帧。
+
+        失败时抛出异常，由调用方回退到抽帧方案。
+        """
+        model_info, client = self._find_gemini_direct_model()
+        if not model_info or not client:
+            raise RuntimeError(
+                "utils_video 任务的模型列表中没有走 aiohttp_gemini 客户端的模型，无法使用视频直传"
+            )
+
+        prompt = (
+            f"你将看到一段视频（包含画面和声音）。\n"
+            f"你的人设核心：{self.personality_core}\n人格侧面：{self.personality_side}\n"
+            f"请以第一人称、符合人设的口吻描述视频内容（主题/人物与场景/动作与时间线/对白或声音/情绪氛围/特殊元素）。\n"
+            f"要求：直接开始描述正文，禁止自我介绍、禁止'我正在观看/审视'之类的过程性开场白，控制在300字以内。"
+        )
+        if question:
+            prompt += f"\n用户关注: {question}"
+
+        # Gemini 的思考 token 计入 maxOutputTokens，给足余量防止描述被思考挤掉而截断
+        try:
+            max_tokens = int(getattr(self.video_llm.model_for_task, "max_tokens", 2048)) or 2048
+        except Exception:
+            max_tokens = 2048
+        max_tokens = max(max_tokens, 2048)
+
+        resp = await client.get_video_response(
+            model_info=model_info,
+            prompt=prompt,
+            video_bytes=video_bytes,
+            mime_type="video/mp4",
+            max_tokens=max_tokens,
+            low_resolution=self.direct_low_resolution,
+            extra_params=model_info.extra_params or None,
+        )
+        if not resp.content:
+            raise RuntimeError("视频直传未获得响应内容")
+        if resp.usage:
+            logger.info(
+                f"视频直传完成 (模型: {model_info.name}): "
+                f"输入 {resp.usage.prompt_tokens} tokens, 输出 {resp.usage.completion_tokens} tokens"
+            )
+        return resp.content
+
     # ---- 主入口 ----
     async def analyze_video(self, video_path: str, question: str | None = None) -> tuple[bool, str]:
         if not os.path.exists(video_path):
             return False, "❌ 文件不存在"
+
+        # 视频直传模式：整个视频交给 Gemini；失败时自动回退到抽帧方案
+        if self.analysis_mode == "gemini_direct":
+            try:
+                with open(video_path, "rb") as f:
+                    video_bytes = f.read()
+                text = await self._analyze_direct(video_bytes, question)
+                return True, text
+            except Exception as e:
+                logger.warning(f"视频直传失败，回退到抽帧分析: {e}")
+
         frames = await self.extract_keyframes(video_path)
         if not frames:
             return False, "❌ 未提取到关键帧"
-        mode = self.analysis_mode
+        # 模式名映射：配置文件用 batch_frames/frame_by_frame，代码内部用 batch/sequential
+        mode = {
+            "batch_frames": "batch",
+            "frame_by_frame": "sequential",
+            "gemini_direct": "batch",  # 直传失败回退时按批量处理
+        }.get(self.analysis_mode, self.analysis_mode)
         if mode == "auto":
             mode = "batch" if len(frames) <= 20 else "sequential"
         text = await (
@@ -199,17 +285,19 @@ class VideoAnalyzer:
         q = prompt if prompt is not None else question
         video_hash = hashlib.sha256(video_bytes).hexdigest()
 
-        # 查缓存
+        # 查缓存（注意：SQLAlchemy 2.0 的 Row 不支持用 Column 对象索引，必须用 select 指定列后按位置取值）
         try:
             async with get_db_session() as session:  # type: ignore
-                row = await session.execute(
-                    Videos.__table__.select().where(Videos.video_hash == video_hash)  # type: ignore
-                )
-                existing = row.first()
-                if existing and existing[Videos.description] and existing[Videos.vlm_processed]:  # type: ignore
-                    return {"summary": existing[Videos.description]}  # type: ignore
-        except Exception:  # pragma: no cover
-            pass
+                row = (
+                    await session.execute(
+                        select(Videos.description, Videos.vlm_processed).where(Videos.video_hash == video_hash)
+                    )
+                ).first()
+                if row and row[0] and row[1]:
+                    logger.debug(f"视频分析缓存命中: {video_hash[:16]}...")
+                    return {"summary": row[0]}
+        except Exception as e:  # pragma: no cover
+            logger.debug(f"视频缓存查询失败: {e}")
 
         # 获取锁避免重复处理
         async with _locks_guard:
@@ -221,14 +309,16 @@ class VideoAnalyzer:
             # 双检：进入锁后再查一次，避免重复处理
             try:
                 async with get_db_session() as session:  # type: ignore
-                    row = await session.execute(
-                        Videos.__table__.select().where(Videos.video_hash == video_hash)  # type: ignore
-                    )
-                    existing = row.first()
-                    if existing and existing[Videos.description] and existing[Videos.vlm_processed]:  # type: ignore
-                        return {"summary": existing[Videos.description]}  # type: ignore
-            except Exception:  # pragma: no cover
-                pass
+                    row = (
+                        await session.execute(
+                            select(Videos.description, Videos.vlm_processed).where(Videos.video_hash == video_hash)
+                        )
+                    ).first()
+                    if row and row[0] and row[1]:
+                        logger.debug(f"视频分析缓存命中（锁内双检）: {video_hash[:16]}...")
+                        return {"summary": row[0]}
+            except Exception as e:  # pragma: no cover
+                logger.debug(f"视频缓存双检查询失败: {e}")
 
             try:
                 with tempfile.NamedTemporaryFile(delete=False) as fp:
@@ -256,8 +346,8 @@ class VideoAnalyzer:
                                     )
                                 )
                                 await session.commit()
-                        except Exception:  # pragma: no cover
-                            pass
+                        except Exception as e:  # pragma: no cover
+                            logger.warning(f"视频分析结果写入缓存失败（下次将重复分析）: {e}")
                     return {"summary": summary}
                 finally:
                     if os.path.exists(temp_path):

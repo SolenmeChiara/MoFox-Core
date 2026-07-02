@@ -237,15 +237,17 @@ class ImageManager:
             image_bytes = base64.b64decode(image_base64)
             image_hash = hashlib.md5(image_bytes).hexdigest()
 
-            # 1.5. 如果是GIF，先转换为JPG
+            # 1.5. 如果是GIF，按配置决定原格式直传还是转换为JPG拼图
             try:
                 image_format_check = (Image.open(io.BytesIO(image_bytes)).format or "jpeg").lower()
                 if image_format_check == "gif":
-                    logger.info(f"检测到GIF图片 (Hash: {image_hash[:8]}...)，正在转换为JPG...")
-                    if transformed_b64 := self.transform_gif(image_base64):
+                    if global_config and global_config.emoji.gif_native_upload:
+                        # GIF原格式直传：下游按所选模型能力决定原样发送或自动切帧
+                        logger.info(f"检测到GIF图片 (Hash: {image_hash[:8]}...)，原格式直传")
+                    elif transformed_b64 := self.transform_gif(image_base64):
+                        logger.info(f"检测到GIF图片 (Hash: {image_hash[:8]}...)，已转换为JPG拼图")
                         image_base64 = transformed_b64
                         image_bytes = base64.b64decode(image_base64)
-                        logger.info("GIF转换成功，将使用转换后的图片进行描述")
                     else:
                         logger.error("GIF转换失败，无法生成描述")
                         return "[图片(GIF转换失败)]"
@@ -283,8 +285,9 @@ class ImageManager:
                 try:
                     image_format = (Image.open(io.BytesIO(image_bytes)).format or "jpeg").lower()
                     logger.info(f"[VLM调用] 正在为图片生成描述 (第 {i+1}/3 次)...")
+                    # max_tokens 给足余量：Gemini 的思考 token 计入输出上限，300 会导致描述被截断
                     description, response_tuple = await self.vlm.generate_response_for_image(
-                        prompt, image_base64, image_format, temperature=0.4, max_tokens=300
+                        prompt, image_base64, image_format, temperature=0.4, max_tokens=1000
                     )
                     # response_tuple is (reasoning, model_name, tool_calls)
                     model_name_used = response_tuple[1]
