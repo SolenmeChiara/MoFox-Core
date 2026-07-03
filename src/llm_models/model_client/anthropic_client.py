@@ -12,6 +12,7 @@ Anthropic 原生客户端 - 直接调用 /v1/messages 端点
 """
 
 import asyncio
+import hashlib
 import time
 from collections.abc import Callable
 from typing import Any, ClassVar
@@ -39,6 +40,16 @@ logger = get_logger("Anthropic客户端")
 ANTHROPIC_VERSION = "2023-06-01"
 DEFAULT_CACHE_TTL = "1h"  # 1h TTL：写入费 2x（5m 为 1.25x）但读只要 0.1x，bot 流量稀疏（间隔常超 5 分钟）时更划算；如需改回填 "5m"
 MAX_CACHE_BREAKPOINTS = 4  # Anthropic 单次请求最多允许 4 个 cache_control 断点
+
+# —— 缓存保活（keep-alive）——
+# 周期性用 max_tokens=1 的迷你请求原样重放"已缓存前缀"，只付 0.1x 读取费即可刷新 TTL，
+# 避免流量空窗后下一次真实请求重付 2x 写入费。缓存条目以内容前缀为键，生成参数不影响命中。
+# 真实流量停止超过 HORIZON 后放弃保活，让缓存自然过期（防止对着无人聊天永远续命）。
+CACHE_KEEPALIVE_ENABLED = True
+CACHE_KEEPALIVE_CHECK_INTERVAL = 300  # 保活检查周期（秒）
+CACHE_KEEPALIVE_REFRESH_MARGIN = 2700  # 距上次触达（真实请求或ping）多久后预热；须小于 TTL（1h=3600s）
+CACHE_KEEPALIVE_HORIZON = 6 * 3600  # 该前缀的真实流量停止多久后放弃保活
+CACHE_KEEPALIVE_MAX_ENTRIES = 16  # 同时保活的前缀数量上限（超出按最久未用淘汰）
 
 # extra_params 中思考/努力程度相关的友好配置键（会被翻译成 Anthropic 原生参数，不会原样发给 API）
 VALID_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
@@ -457,6 +468,10 @@ class AnthropicClient(BaseClient):
         # 控制 cache_control 断点总数不超过 API 上限
         _enforce_breakpoint_limit(body)
 
+        # 注册缓存前缀用于 TTL 保活（仅当 body 含 cache_control 断点时生效）
+        if CACHE_KEEPALIVE_ENABLED:
+            _cache_keepalive.register(self, body)
+
         client = self._get_http_client()
 
         try:
@@ -514,6 +529,162 @@ def _cache_control_payload() -> dict[str, Any]:
     return {"type": "ephemeral", "ttl": DEFAULT_CACHE_TTL}
 
 
-# 防止未使用 import 告警（time/ToolOptionBuilder 留作扩展占位）
-_ = time
+def _extract_prefix_body(body: dict[str, Any]) -> dict[str, Any] | None:
+    """
+    从最终请求体中截取"到最后一个 cache_control 断点为止"的最小请求体。
+
+    Anthropic 的缓存条目按内容前缀（tools → system → messages 渲染序）匹配，
+    生成参数（max_tokens/thinking 等）不参与匹配——所以用这个截取体发一个
+    max_tokens=1 的迷你请求，就能以 0.1x 读取费刷新前缀上所有断点的 TTL。
+    无任何断点时返回 None。
+    """
+    tools = body.get("tools")
+    system = body.get("system")
+    messages = body.get("messages", [])
+
+    last_mi, last_bi = -1, -1
+    for mi, msg in enumerate(messages):
+        content = msg.get("content")
+        if isinstance(content, list):
+            for bi, blk in enumerate(content):
+                if isinstance(blk, dict) and "cache_control" in blk:
+                    last_mi, last_bi = mi, bi
+
+    has_sys_bp = isinstance(system, list) and any(
+        isinstance(b, dict) and "cache_control" in b for b in system
+    )
+    has_tool_bp = isinstance(tools, list) and any(
+        isinstance(t, dict) and "cache_control" in t for t in tools
+    )
+    if last_mi < 0 and not has_sys_bp and not has_tool_bp:
+        return None
+
+    ping: dict[str, Any] = {"model": body["model"]}
+    if tools:
+        ping["tools"] = tools
+    if system:
+        ping["system"] = system
+    if last_mi >= 0:
+        msgs = [dict(m) for m in messages[: last_mi + 1]]
+        last_msg = dict(msgs[-1])
+        content = last_msg.get("content")
+        if isinstance(content, list):
+            last_msg["content"] = content[: last_bi + 1]
+        msgs[-1] = last_msg
+        ping["messages"] = msgs
+    else:
+        # 断点只在 system/tools 上：messages 不能为空，补一个极小的动态尾巴
+        ping["messages"] = [{"role": "user", "content": "."}]
+    return ping
+
+
+class _CacheKeepAlive:
+    """
+    缓存前缀保活器。
+
+    每次真实请求发出前把它的缓存前缀登记进来（真实请求本身就刷新了 TTL，
+    所以登记同时重置计时）；后台任务周期检查，距上次触达超过 REFRESH_MARGIN
+    的条目会收到一个 max_tokens=1 的迷你请求续命。前缀的真实流量停止超过
+    HORIZON 后条目被移除，缓存自然过期。
+    """
+
+    def __init__(self) -> None:
+        self._entries: dict[str, dict[str, Any]] = {}
+        self._task: asyncio.Task | None = None
+
+    def register(self, client: "AnthropicClient", body: dict[str, Any]) -> None:
+        ping = _extract_prefix_body(body)
+        if ping is None:
+            return
+        key = hashlib.md5(orjson.dumps(ping)).hexdigest()
+        now = time.time()
+        entry = self._entries.get(key)
+        if entry is not None:
+            # 真实请求命中同一前缀 = TTL 已被免费刷新
+            entry["last_seen"] = now
+            entry["last_touch"] = now
+        else:
+            if len(self._entries) >= CACHE_KEEPALIVE_MAX_ENTRIES:
+                oldest = min(self._entries, key=lambda k: self._entries[k]["last_seen"])
+                self._entries.pop(oldest, None)
+            self._entries[key] = {
+                "ping": ping,
+                "client": client,
+                "model": body.get("model", "?"),
+                "last_seen": now,
+                "last_touch": now,
+                "ping_max_tokens": 1,
+            }
+        self._ensure_task()
+
+    def _ensure_task(self) -> None:
+        if self._task is not None and not self._task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._task = loop.create_task(self._loop(), name="anthropic-cache-keepalive")
+
+    async def _loop(self) -> None:
+        while True:
+            await asyncio.sleep(CACHE_KEEPALIVE_CHECK_INTERVAL)
+            try:
+                now = time.time()
+                for key in list(self._entries.keys()):
+                    entry = self._entries.get(key)
+                    if entry is None:
+                        continue
+                    if now - entry["last_seen"] > CACHE_KEEPALIVE_HORIZON:
+                        logger.debug(f"缓存保活: [{entry['model']}] 前缀 {key[:8]} 超过保活时限，停止续命")
+                        self._entries.pop(key, None)
+                        continue
+                    if now - entry["last_touch"] < CACHE_KEEPALIVE_REFRESH_MARGIN:
+                        continue
+                    await self._ping(key, entry)
+            except Exception as e:  # 保活失败绝不能影响主流程
+                logger.warning(f"缓存保活循环异常: {e}")
+
+    async def _ping(self, key: str, entry: dict[str, Any]) -> None:
+        client: AnthropicClient = entry["client"]
+        body = dict(entry["ping"])
+        body["max_tokens"] = entry["ping_max_tokens"]
+        try:
+            http = client._get_http_client()
+            response = await http.post("/messages", content=orjson.dumps(body))
+        except httpx.HTTPError as e:
+            logger.warning(f"缓存保活: [{entry['model']}] 前缀 {key[:8]} ping 网络失败: {e}")
+            return
+
+        if response.status_code != 200:
+            try:
+                err_msg = response.json().get("error", {}).get("message", "") or response.text
+            except Exception:
+                err_msg = response.text
+            # 个别模型可能拒绝 max_tokens=1（如思考强制开启的场景），放宽后下轮重试
+            if response.status_code == 400 and "max_tokens" in err_msg and entry["ping_max_tokens"] == 1:
+                entry["ping_max_tokens"] = 64
+                logger.info(f"缓存保活: [{entry['model']}] 不接受 max_tokens=1，放宽为 64 后重试")
+            else:
+                logger.warning(f"缓存保活: [{entry['model']}] ping 失败 {response.status_code}: {err_msg[:120]}")
+            return
+
+        entry["last_touch"] = time.time()
+        try:
+            usage = orjson.loads(response.content).get("usage", {})
+            cache_read = usage.get("cache_read_input_tokens", 0)
+            cache_create = usage.get("cache_creation_input_tokens", 0)
+        except Exception:
+            cache_read = cache_create = 0
+        if cache_create and not cache_read:
+            # ping 到达时缓存已过期，本次相当于替下一个真实请求预付了重写费
+            logger.info(f"缓存保活: [{entry['model']}] 前缀 {key[:8]} 已过期，重写 {cache_create} tokens")
+        else:
+            logger.info(f"缓存保活: [{entry['model']}] 前缀 {key[:8]} 续命成功，读取 {cache_read} tokens（0.1x费率）")
+
+
+_cache_keepalive = _CacheKeepAlive()
+
+
+# 防止未使用 import 告警（ToolOptionBuilder 留作扩展占位）
 _ = ToolOptionBuilder
