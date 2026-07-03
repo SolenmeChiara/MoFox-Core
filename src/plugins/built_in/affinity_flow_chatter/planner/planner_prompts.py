@@ -17,29 +17,17 @@ def init_prompts():
     # 核心规划器提示词，用于在接收到新消息时决定如何回应。
     # 它构建了一个复杂的上下文，包括历史记录、可用动作、角色设定等，
     # 并要求模型以 JSON 格式输出一个或多个动作组合。
+    #
+    # 段落排序说明（prompt cache）：跨请求稳定的静态段（身份/自定义指导/回复策略/
+    # 思绪流规范/动作列表/输出格式/强制规则/审核提示）集中放在最前，之后的
+    # {cache_breakpoint} 是缓存断点标记——anthropic 客户端在此处打 cache_control，
+    # 其他客户端发送前自动剥离；动态段（时间/心情/日程/历史）全部放在断点之后。
+    # 注意：动作列表偶尔会因激活判定变化（如 send_feed），届时该轮缓存失效重写，可接受。
     Prompt(
         """
-{time_block}
-{mood_block}
 {identity_block}
-{schedule_block}
-
-{users_in_chat}
 {custom_prompt_block}
 {chat_context_description}。
-
-{actions_before_now_block}
-
-## 🤔 最近的决策历史 (回顾你之前的思考与动作，可以帮助你避免重复，并做出更有趣的连贯回应)
-{decision_history_block}
-
-## 📜 已读历史（仅供理解，不可作为动作对象）
-{read_history_block}
-
-## 📬 未读历史（只能对这里的消息执行动作）
-{unread_history_block}
-
-{moderation_prompt}
 
 {reply_strategy_block}
 
@@ -61,7 +49,25 @@ def init_prompts():
 - 需要目标消息的动作，target_message_id 提取统一使用一套流程，没有任何区别对待
 - 如果没有合适的目标或无需动作，请返回空的 actions 列表： "actions": []
 
+{moderation_prompt}
+{cache_breakpoint}
+{time_block}
+{mood_block}
+{schedule_block}
+{users_in_chat}
+{actions_before_now_block}
+
+## 🤔 最近的决策历史 (回顾你之前的思考与动作，可以帮助你避免重复，并做出更有趣的连贯回应)
+{decision_history_block}
+
+## 📜 已读历史（仅供理解，不可作为动作对象）
+{read_history_block}
+
+## 📬 未读历史（只能对这里的消息执行动作）
+{unread_history_block}
+
 {no_action_block}
+现在，请结合以上未读消息，按前述输出格式只输出 JSON。
 """,
         "planner_prompt",
     )

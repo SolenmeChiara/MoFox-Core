@@ -18,6 +18,7 @@ from src.chat.utils.prompt import global_prompt_manager
 from src.common.data_models.info_data_model import ActionPlannerInfo, Plan
 from src.common.logger import get_logger
 from src.config.config import global_config, model_config
+from src.llm_models.payload_content.message import CACHE_BREAKPOINT_MARKER
 from src.llm_models.utils_model import LLMRequest
 from src.mood.mood_manager import mood_manager
 from src.plugin_system.base.component_types import ActionInfo, ChatType
@@ -417,6 +418,12 @@ class ChatterPlanFilter:
 ```
 """
 
+            # Prompt.format 是单遍替换：作为"值"插入的文本里的占位符/转义花括号不会被
+            # 二次处理，这里先行展开 {mentioned_bonus}，并把 JSON 示例中的 {{ }} 还原为 { }
+            # （否则最终 prompt 里会出现字面的 "{mentioned_bonus}" 和双花括号）
+            reply_strategy_block = reply_strategy_block.format(mentioned_bonus=mentioned_bonus)
+            output_format_block = output_format_block.format()
+
             format_params = {
                 "schedule_block": schedule_block,
                 "mood_block": mood_block,
@@ -426,7 +433,6 @@ class ChatterPlanFilter:
                 "read_history_block": read_history_block,
                 "unread_history_block": unread_history_block,
                 "actions_before_now_block": actions_before_now_block,
-                "mentioned_bonus": mentioned_bonus,
                 "no_action_block": no_action_block,
                 "action_options_text": action_options_block,
                 "moderation_prompt": moderation_prompt_block,
@@ -436,6 +442,9 @@ class ChatterPlanFilter:
                 "users_in_chat": users_in_chat_str,
                 "reply_strategy_block": reply_strategy_block,
                 "output_format_block": output_format_block,
+                # 缓存断点：静态段（身份~审核提示）与动态段（时间/历史）的分界，
+                # anthropic 客户端在此打 cache_control，其他客户端发送前剥离
+                "cache_breakpoint": CACHE_BREAKPOINT_MARKER,
             }
             prompt = planner_prompt_template.format(**format_params)
             return prompt, message_id_list
