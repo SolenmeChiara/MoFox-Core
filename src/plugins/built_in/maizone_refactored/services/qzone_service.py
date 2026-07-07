@@ -26,6 +26,7 @@ from .image_service import ImageService
 from .reply_tracker_service import ReplyTrackerService
 
 if TYPE_CHECKING:
+    from .comment_tracking_service import CommentTrackingService
     from .person_memory_service import PersonMemoryService
 
 logger = get_logger("MaiZone.QZoneService")
@@ -50,6 +51,116 @@ def _loads_lenient(text: str) -> Any:
     return orjson.loads(t)
 
 
+def _fmt_comment_time(node: dict) -> tuple[str, int]:
+    """从一个评论节点解析 ``(格式化时间字符串, 原始时间戳)``。
+
+    优先用 ``createTime2``（已是可读的 YYYY-MM-DD HH:MM:SS）作为展示串，
+    ``create_time`` 作为原始时间戳（int，用于时间线比较）；拿不到时间戳返回 0。
+    """
+    ts = 0
+    raw = node.get("create_time")
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        ts = int(raw)
+    elif isinstance(raw, str) and raw.isdigit():
+        ts = int(raw)
+
+    fmt = ""
+    if node.get("createTime2"):
+        fmt = str(node.get("createTime2"))
+    elif ts:
+        try:
+            fmt = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+        except (ValueError, OSError):
+            fmt = ""
+    return fmt, ts
+
+
+def _parse_comment_tree(commentlist: Any) -> list[dict]:
+    """把 msglist / msgdetail 的 ``commentlist[]`` 展开为扁平评论列表（含楼中楼 ``list_3``）。
+
+    统一供 ``_list_feeds`` 与 ``_get_feed_detail`` 复用，避免两份解析拷贝。每条评论字段：
+
+    - ``qq_account``：评论者 QQ（原始值，可能是 int）
+    - ``nickname`` / ``content``
+    - ``comment_tid``：评论 tid（顶层为 feed 内从 1 起的楼层序号；楼中楼为子回复 tid）
+    - ``parent_tid``：顶层为 None；楼中楼为其所属顶层评论的 tid
+    - ``create_time``：格式化时间字符串（解析失败为 ""）
+    - ``create_ts``：原始时间戳（int），拿不到为 0，用于时间线比较
+    - ``t2_subtype``：顶层评论类型（0 普通 / 1 回复型），楼中楼固定 None
+    - ``is_sub``：是否为楼中楼子回复
+    - ``reply_num``：顶层评论的楼中楼数量（reply_num / replyNum 多候选）
+
+    ``_list_feeds`` 下游只读前 6 个字段，其余为接话闭环新增，多出来的键不影响既有逻辑。
+    ``list_3`` 的 @/targetuin 等字段未全部实测确认，这里只取确定存在的字段并全程防御性判空。
+    """
+    comments: list[dict] = []
+    if not isinstance(commentlist, list):
+        return comments
+
+    for c in commentlist:
+        if not isinstance(c, dict):
+            continue
+        c_fmt, c_ts = _fmt_comment_time(c)
+
+        # 楼中楼数量：reply_num / replyNum 多候选取值
+        reply_num = 0
+        for k in ("reply_num", "replyNum"):
+            v = c.get(k)
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                reply_num = int(v)
+                break
+            if isinstance(v, str) and v.isdigit():
+                reply_num = int(v)
+                break
+
+        # t2_subtype 防御性取值（0 普通 / 1 回复型）
+        t2_raw = c.get("t2_subtype")
+        if isinstance(t2_raw, (int, float)) and not isinstance(t2_raw, bool):
+            t2_subtype: int | None = int(t2_raw)
+        elif isinstance(t2_raw, str) and t2_raw.lstrip("-").isdigit():
+            t2_subtype = int(t2_raw)
+        else:
+            t2_subtype = None
+
+        comments.append(
+            {
+                "qq_account": c.get("uin"),
+                "nickname": c.get("name"),
+                "content": c.get("content"),
+                "comment_tid": c.get("tid"),
+                "parent_tid": None,  # 主评论没有父ID
+                "create_time": c_fmt,
+                "create_ts": c_ts,
+                "t2_subtype": t2_subtype,
+                "is_sub": False,
+                "reply_num": reply_num,
+            }
+        )
+
+        # 楼中楼子回复 list_3
+        sub_list = c.get("list_3")
+        if isinstance(sub_list, list):
+            for r in sub_list:
+                if not isinstance(r, dict):
+                    continue
+                r_fmt, r_ts = _fmt_comment_time(r)
+                comments.append(
+                    {
+                        "qq_account": r.get("uin"),
+                        "nickname": r.get("name"),
+                        "content": r.get("content"),
+                        "comment_tid": r.get("tid"),
+                        "parent_tid": c.get("tid"),  # 父ID是所属主评论的 tid
+                        "create_time": r_fmt,
+                        "create_ts": r_ts,
+                        "t2_subtype": None,
+                        "is_sub": True,
+                        "reply_num": 0,
+                    }
+                )
+    return comments
+
+
 class QZoneService:
     """
     QQ空间服务类，负责所有API交互和业务流程编排。
@@ -61,6 +172,8 @@ class QZoneService:
     DOLIKE_URL = "https://user.qzone.qq.com/proxy/domain/w.qzone.qq.com/cgi-bin/likes/internal_dolike_app"
     COMMENT_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_re_feeds"
     LIST_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qq.com/cgi-bin/emotion_cgi_msglist_v6"
+    # 单条说说详情（含完整评论楼 + 楼中楼），接话闭环用；与 msglist 同域同签名，跨用户可读
+    MSGDETAIL_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qq.com/cgi-bin/emotion_cgi_msgdetail_v6"
     REPLY_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_re_feeds"
     # 只读社交接口（社交闭环功能：计数门 / 访客回访 / 回赞）
     # 访客列表：已只读实测可用（走 user.qzone 代理域，返回 _Callback 包裹的 JSON，code=0）
@@ -78,6 +191,7 @@ class QZoneService:
         cookie_service: CookieService,
         reply_tracker: ReplyTrackerService | None = None,
         person_memory: "PersonMemoryService | None" = None,
+        comment_tracking: "CommentTrackingService | None" = None,
     ):
         self.get_config = get_config
         self.content_service = content_service
@@ -87,6 +201,8 @@ class QZoneService:
         self.reply_tracker = reply_tracker if reply_tracker is not None else ReplyTrackerService()
         # 空间人物记忆服务（可选）：负责把互动对象注册进记人系统并积累空间互动记录
         self.person_memory = person_memory
+        # 好友说说评论追踪服务（可选）：接话闭环用，追踪 bot 评论过的好友说说
+        self.comment_tracking = comment_tracking
         # 用于防止并发回复/评论的内存锁
         self.processing_comments = set()
 
@@ -690,7 +806,7 @@ class QZoneService:
                     target_qq=target_qq,
                 )
                 if comment_text:
-                    success = await api_client["comment"](target_qq, fid, comment_text)
+                    success, new_comment_tid = await api_client["comment"](target_qq, fid, comment_text)
                     if success:
                         self.reply_tracker.mark_as_replied(fid, "main_comment")
                         logger.info(f"成功评论'{target_name}'的说说: '{comment_text}'")
@@ -703,6 +819,21 @@ class QZoneService:
                             their_content=content or rt_con or "",
                             bot_reply=comment_text,
                         )
+                        # 接话闭环：仅在功能开启时把这条已评论的好友说说加入追踪，
+                        # 关闭时不写盘（省成本、避免存储无界增长；开启后新评论自然进入追踪）。
+                        if self.comment_tracking is not None and self.get_config(
+                            "comment_reply.enable_comment_reply", False
+                        ):
+                            try:
+                                self.comment_tracking.add_commented_feed(
+                                    feed_id=fid,
+                                    host_qq=target_qq,
+                                    host_name=target_name,
+                                    bot_comment_content=comment_text,
+                                    bot_comment_tid=new_comment_tid,
+                                )
+                            except Exception as e:
+                                logger.warning(f"[接话] 追踪已评论说说失败(fid={fid}): {e}")
                     else:
                         logger.error(f"评论'{target_name}'的说说失败")
             except Exception as e:
@@ -752,6 +883,211 @@ class QZoneService:
             )
         except Exception as e:
             logger.warning(f"记录空间互动记忆失败(qq={qq}): {e}")
+
+    # --- 好友说说「接话闭环」---
+
+    @staticmethod
+    def _detect_replies_to_bot(
+        comments: list[dict],
+        bot_qq: str,
+        bot_tid: Any,
+        bot_ts: int,
+        bot_name: str,
+        host_qq: str,
+    ) -> list[dict]:
+        """双路检测「回复了 bot 评论」的新消息（按时间升序返回，先接早的）。
+
+        路 (a) 楼中楼：``list_3`` 里 ``parent_tid`` 指向 bot 评论 tid 的子回复（is_sub 且 parent 命中）。
+        路 (b) 平铺 level-2 评论：``uin != bot``、时间晚于 bot 评论，且（content 含 ``@bot昵称``
+               或 ``uin == 楼主``）。因为 bot 自己的 ``_reply`` 实测表现为平铺 level-2（t2_subtype=1、
+               content="@昵称 正文"、不进 list_3），故他人回复 bot 也走此形态。
+
+        时间戳缺失（拿不到 create_ts）时对路 (b) 放宽时间过滤，改由上层 seen 去重兜底。
+        """
+        bot_qq = str(bot_qq or "")
+        bot_tid_str = str(bot_tid) if bot_tid is not None else None
+        host_qq = str(host_qq or "")
+        at_token = f"@{bot_name}" if bot_name else None
+
+        found: list[dict] = []
+        seen_local: set[str] = set()
+
+        def _push(node: dict) -> None:
+            k = f"{node.get('qq_account')}_{node.get('comment_tid')}"
+            if k not in seen_local:
+                seen_local.add(k)
+                found.append(node)
+
+        for c in comments:
+            if not isinstance(c, dict):
+                continue
+            uin = str(c.get("qq_account", "") or "")
+            if not uin or uin == bot_qq:
+                continue
+            c_ts = c.get("create_ts", 0) or 0
+
+            # 路 (a): 楼中楼子回复，parent 指向 bot 的评论楼
+            if c.get("is_sub"):
+                if bot_tid_str is not None and str(c.get("parent_tid")) == bot_tid_str:
+                    _push(c)
+                continue
+
+            # 路 (b): 平铺 level-2 评论
+            # 时间要晚于 bot 评论；任一时间戳拿不到时放宽（靠 seen 去重兜底）
+            later = (c_ts == 0 or bot_ts == 0) or (c_ts >= bot_ts)
+            if not later:
+                continue
+            content = str(c.get("content", "") or "")
+            mentions_bot = bool(at_token and at_token in content)
+            is_host = uin == host_qq
+            if mentions_bot or is_host:
+                _push(c)
+
+        found.sort(key=lambda x: x.get("create_ts", 0) or 0)
+        return found
+
+    async def check_comment_replies(self) -> None:
+        """好友说说接话闭环：轮询 bot 评论过的好友说说，发现回复 bot 的新消息则结合记忆定向接话。
+
+        默认关闭（``comment_reply.enable_comment_reply=false``）。整体失败隔离，绝不影响监控主流程。
+        """
+        try:
+            if not self.get_config("comment_reply.enable_comment_reply", False):
+                return
+            if self.comment_tracking is None:
+                return
+
+            ttl_hours = float(self.get_config("comment_reply.tracking_ttl_hours", 72))
+            ttl_seconds = ttl_hours * 3600
+            max_replies_per_round = int(self.get_config("comment_reply.max_replies_per_round", 3))
+            per_feed_limit = int(self.get_config("comment_reply.per_feed_reply_limit", 2))
+
+            # 先清理过期，再取活跃追踪 feed
+            self.comment_tracking.cleanup(ttl_seconds)
+            active = self.comment_tracking.get_active_feeds(ttl_seconds)
+            if not active:
+                return
+
+            qq_account = str(config_api.get_global_config("bot.qq_account", "") or "")
+            api_client = await self._get_api_client(qq_account, None)
+            if not api_client:
+                logger.debug("[接话] 无法获取API客户端，跳过本轮接话检查")
+                return
+
+            logger.info(f"[接话] 开始检查 {len(active)} 条已评论好友说说的回复情况")
+            replies_done = 0
+
+            for fid, entry in active:
+                if replies_done >= max_replies_per_round:
+                    break
+                host_qq = str(entry.get("host_qq", "") or "")
+                host_name = entry.get("host_name", "") or host_qq
+                if not host_qq:
+                    continue
+
+                # feed 之间留间隔，降低风控
+                await asyncio.sleep(random.uniform(3, 6))
+
+                detail = await api_client["get_feed_detail"](host_qq, fid)
+                if not detail:
+                    continue
+                comments = detail.get("comments", [])
+                if not comments:
+                    continue
+
+                # 定位 bot 自己的楼：uin==bot 的顶层评论（reply_tracker 的 main_comment 幂等
+                # 保证 bot 对每条好友说说只评一次，故 uin==bot 的顶层评论唯一）
+                bot_comment = next(
+                    (
+                        c
+                        for c in comments
+                        if not c.get("is_sub") and str(c.get("qq_account", "")) == qq_account
+                    ),
+                    None,
+                )
+                if bot_comment is None:
+                    # 找不到 bot 的评论：多半评论被删，从追踪表剔除
+                    logger.info(f"[接话] 说说 {fid} 下未找到 bot 的评论（可能已被删），移除追踪")
+                    self.comment_tracking.remove_feed(fid)
+                    continue
+
+                bot_tid = bot_comment.get("comment_tid")
+                bot_ts = bot_comment.get("create_ts", 0) or 0
+                bot_name = bot_comment.get("nickname", "") or ""
+                bot_comment_content = entry.get("bot_comment_content", "") or bot_comment.get("content", "") or ""
+                # 回填当初评论时没拿到的楼层序号
+                if bot_tid:
+                    self.comment_tracking.update_bot_comment_tid(fid, bot_tid)
+
+                # --- 双路检测「回复了 bot」的新消息 ---
+                new_replies = self._detect_replies_to_bot(
+                    comments=comments,
+                    bot_qq=qq_account,
+                    bot_tid=bot_tid,
+                    bot_ts=bot_ts,
+                    bot_name=bot_name,
+                    host_qq=host_qq,
+                )
+
+                for rep in new_replies:
+                    if replies_done >= max_replies_per_round:
+                        break
+                    replier_uin = str(rep.get("qq_account", "") or "")
+                    rep_tid = rep.get("comment_tid")
+                    key = f"{replier_uin}_{rep_tid}"
+
+                    if self.comment_tracking.has_seen(fid, key):
+                        continue
+                    # 无论最终是否接话，先标记已见，避免下轮重复评估
+                    self.comment_tracking.mark_reply_seen(fid, key)
+
+                    # 防刷楼 1：本 feed 接话次数达上限 → 仍追踪但只 mark seen 不再回复
+                    if self.comment_tracking.get_reply_count(fid) >= per_feed_limit:
+                        continue
+                    # 防刷楼 2：同一 feed 的同一个人只接一次话
+                    if self.comment_tracking.has_replied_to(fid, replier_uin):
+                        continue
+
+                    replier_name = rep.get("nickname", "") or replier_uin
+                    reply_text = rep.get("content", "") or ""
+
+                    # 结合记忆生成接话（客套收尾会返回 None 表示不接）
+                    thread_reply = await self.content_service.generate_thread_reply(
+                        host_name=host_name,
+                        host_qq=host_qq,
+                        story_content=detail.get("content", "") or bot_comment_content,
+                        bot_comment=bot_comment_content,
+                        replier_name=replier_name,
+                        replier_qq=replier_uin,
+                        reply_content=reply_text,
+                    )
+                    if not thread_reply:
+                        logger.info(f"[接话] 对 {replier_name} 的回复选择不接话（客套/无实质内容/生成失败）")
+                        continue
+
+                    # parent_tid 用 bot 自己的评论楼层序号：把接话挂在 bot 起的楼里，content 里 @对方
+                    parent_tid = bot_tid or rep_tid
+                    ok = await api_client["reply"](fid, host_qq, replier_name, thread_reply, parent_tid)
+                    if ok:
+                        self.comment_tracking.record_reply(fid, replier_uin)
+                        replies_done += 1
+                        logger.info(f"[接话] 在 {host_name} 的说说楼里接了 {replier_name} 的话: '{thread_reply}'")
+                        # 记人：把这次「在ta的说说下和ta聊了起来」记进空间互动记忆
+                        await self._remember_interaction(
+                            qq=replier_uin,
+                            nickname=replier_name,
+                            interaction_type="在ta的说说下和ta聊了起来",
+                            their_content=reply_text,
+                            bot_reply=thread_reply,
+                        )
+                        # 接话之间留较长间隔，模拟真人节奏、降低风控
+                        await asyncio.sleep(random.uniform(10, 20))
+                    else:
+                        logger.warning(f"[接话] 回复 {replier_name} 失败(fid={fid})")
+
+            logger.info(f"[接话] 本轮接话检查完成，共接话 {replies_done} 次")
+        except Exception as e:
+            logger.error(f"[接话] 接话闭环轮次异常（不影响监控主流程）: {e}")
 
     # --- 社交闭环只读能力（计数门 / 访客回访 / 回赞）---
     # 这些方法为 SocialLoopService 提供数据，全部失败隔离：任何异常都返回 None/[]，
@@ -1238,79 +1574,10 @@ class QZoneService:
                         images = [pic.get("url1", "") for pic in msg["pictotal"] if pic.get("url1")]
 
                     # --- 解析完整评论列表 (包括二级评论) ---
-                    comments = []
-                    commentlist = msg.get("commentlist")
-
-                    if isinstance(commentlist, list):
-                        for c in commentlist:
-                            if not isinstance(c, dict):
-                                continue
-
-                            # 解析评论时间（优先使用 createTime2，它是完整的格式化时间）
-                            comment_create_time = ""
-                            # 优先使用 createTime2（格式：YYYY-MM-DD HH:MM:SS）
-                            if c.get("createTime2"):
-                                comment_create_time = c.get("createTime2")
-                            elif c.get("create_time"):
-                                # create_time 是时间戳
-                                raw_time = c.get("create_time")
-                                try:
-                                    if isinstance(raw_time, (int, float)):
-                                        comment_create_time = time.strftime(
-                                            "%Y-%m-%d %H:%M:%S", time.localtime(int(raw_time))
-                                        )
-                                    elif isinstance(raw_time, str) and raw_time.isdigit():
-                                        comment_create_time = time.strftime(
-                                            "%Y-%m-%d %H:%M:%S", time.localtime(int(raw_time))
-                                        )
-                                except (ValueError, TypeError):
-                                    pass
-
-                            # 添加主评论
-                            comments.append(
-                                {
-                                    "qq_account": c.get("uin"),
-                                    "nickname": c.get("name"),
-                                    "content": c.get("content"),
-                                    "comment_tid": c.get("tid"),
-                                    "parent_tid": None,  # 主评论没有父ID
-                                    "create_time": comment_create_time,  # 添加评论时间
-                                }
-                            )
-                            # 检查并添加二级评论 (回复)
-                            if "list_3" in c and isinstance(c["list_3"], list):
-                                for reply in c["list_3"]:
-                                    if not isinstance(reply, dict):
-                                        continue
-
-                                    # 解析二级评论时间（优先使用 createTime2）
-                                    reply_create_time = ""
-                                    if reply.get("createTime2"):
-                                        reply_create_time = reply.get("createTime2")
-                                    elif reply.get("create_time"):
-                                        raw_time = reply.get("create_time")
-                                        try:
-                                            if isinstance(raw_time, (int, float)):
-                                                reply_create_time = time.strftime(
-                                                    "%Y-%m-%d %H:%M:%S", time.localtime(int(raw_time))
-                                                )
-                                            elif isinstance(raw_time, str) and raw_time.isdigit():
-                                                reply_create_time = time.strftime(
-                                                    "%Y-%m-%d %H:%M:%S", time.localtime(int(raw_time))
-                                                )
-                                        except (ValueError, TypeError):
-                                            pass
-
-                                    comments.append(
-                                        {
-                                            "qq_account": reply.get("uin"),
-                                            "nickname": reply.get("name"),
-                                            "content": reply.get("content"),
-                                            "comment_tid": reply.get("tid"),
-                                            "parent_tid": c.get("tid"),  # 父ID是主评论的ID
-                                            "create_time": reply_create_time,  # 添加评论时间
-                                        }
-                                    )
+                    # 复用公共解析函数（同时供接话闭环的详情解析使用），避免两份拷贝。
+                    # 返回的字典包含既有字段（qq_account/nickname/content/comment_tid/parent_tid/
+                    # create_time），下游逻辑照常读取；多出的 create_ts/t2_subtype 等键会被忽略。
+                    comments = _parse_comment_tree(msg.get("commentlist"))
 
                     feeds_list.append(
                         {
@@ -1335,8 +1602,12 @@ class QZoneService:
                 logger.error(f"获取说说列表失败: {e}")
                 return []
 
-        async def _comment(t_qq: str, feed_id: str, text: str) -> bool:
-            """评论说说"""
+        async def _comment(t_qq: str, feed_id: str, text: str) -> tuple[bool, str | None]:
+            """评论说说。
+
+            返回 ``(是否成功, 新评论tid)``；新评论 tid 从响应体多候选字段中尽力取出，
+            拿不到则为 None（接话闭环会在检测阶段用 uin==bot 兜底定位 bot 的楼，不依赖此值）。
+            """
             try:
                 data = {
                     "topicId": f"{t_qq}_{feed_id}__1",
@@ -1356,18 +1627,31 @@ class QZoneService:
                     response_data = orjson.loads(response_text)
                     code = response_data.get("code", -1)
                     if code == 0:
+                        # 顺手从响应体里取新评论 tid（顶层或 data 子级，多候选防御性取值）
+                        new_tid: str | None = None
+                        candidates: list[dict] = [response_data]
+                        if isinstance(response_data.get("data"), dict):
+                            candidates.append(response_data["data"])
+                        for src in candidates:
+                            for k in ("commentid", "commentId", "tid", "comment_tid"):
+                                v = src.get(k)
+                                if v:
+                                    new_tid = str(v)
+                                    break
+                            if new_tid:
+                                break
                         logger.info(f"评论API返回成功: feed_id={feed_id}")
-                        return True
+                        return True, new_tid
                     else:
                         message = response_data.get("message", "未知错误")
                         logger.error(f"评论API返回失败: code={code}, message={message}, feed_id={feed_id}")
-                        return False
+                        return False, None
                 except orjson.JSONDecodeError:
                     logger.warning(f"评论API响应无法解析为JSON，假定成功: {response_text[:200]}")
-                    return True
+                    return True, None
             except Exception as e:
                 logger.error(f"评论说说异常: {e}")
-                return False
+                return False, None
 
         async def _like(t_qq: str, feed_id: str) -> bool:
             """点赞说说"""
@@ -1449,6 +1733,62 @@ class QZoneService:
             except Exception as e:
                 logger.error(f"回复评论异常: {e}")
                 return False
+
+        async def _get_feed_detail(host_qq: str, feed_id: str) -> dict | None:
+            """拉取单条说说详情（含完整评论楼 + 楼中楼），供好友说说接话闭环检测回复。
+
+            走 taotao.qq.com 代理域的 ``emotion_cgi_msgdetail_v6``（GET，与 msglist 同签名），
+            跨用户可读。任何失败返回 None，由调用方跳过该 feed，绝不影响监控主流程。
+
+            返回：``{"feed_id", "host_qq", "content"(原文), "comments"(_parse_comment_tree 结果)}``。
+            """
+            try:
+                params = {
+                    "g_tk": gtk,
+                    "uin": host_qq,  # 说说作者（楼主）
+                    "tid": feed_id,
+                    "t1_source": 1,
+                    "ftype": 0,
+                    "sort": 0,
+                    "pos": 0,
+                    "num": 20,
+                    "code_version": 1,
+                    "format": "json",
+                    "need_private_comment": 1,
+                }
+                res_text = await _request("GET", self.MSGDETAIL_URL, params=params)
+                data = _loads_lenient(res_text)
+                if not isinstance(data, dict) or data.get("code") != 0:
+                    code = data.get("code") if isinstance(data, dict) else "N/A"
+                    logger.debug(f"获取说说详情返回异常: host={host_qq}, tid={feed_id}, code={code}")
+                    return None
+
+                # commentlist / content 可能在顶层，也可能嵌在 data 子级，做防御性多层取值
+                commentlist = data.get("commentlist")
+                story_content = data.get("content", "")
+                inner = data.get("data") if isinstance(data.get("data"), dict) else {}
+                if isinstance(inner, dict):
+                    if not isinstance(commentlist, list):
+                        commentlist = inner.get("commentlist")
+                    if not story_content:
+                        story_content = inner.get("content", "")
+
+                # 首轮诊断：若 code=0 却没找到 commentlist，打出响应顶层键，便于排查嵌套位置
+                if not isinstance(commentlist, list):
+                    logger.debug(
+                        f"[接话] 说说详情未定位到 commentlist（host={host_qq}, tid={feed_id}）；"
+                        f"响应顶层键={list(data.keys())}"
+                    )
+
+                return {
+                    "feed_id": str(feed_id),
+                    "host_qq": str(host_qq),
+                    "content": story_content or "",
+                    "comments": _parse_comment_tree(commentlist),
+                }
+            except Exception as e:
+                logger.debug(f"获取说说详情失败: host={host_qq}, tid={feed_id}, err={e}")
+                return None
 
         async def _monitor_list_feeds(num: int) -> list[dict]:
             """监控好友动态"""
@@ -1746,13 +2086,14 @@ class QZoneService:
                 logger.debug(f"获取点赞者名单失败: {e}")
                 return []
 
-        logger.debug("API客户端构造完成，返回包含9个方法的字典")
+        logger.debug("API客户端构造完成，返回包含10个方法的字典")
         return {
             "publish": _publish,
             "list_feeds": _list_feeds,
             "comment": _comment,
             "like": _like,
             "reply": _reply,
+            "get_feed_detail": _get_feed_detail,
             "monitor_list_feeds": _monitor_list_feeds,
             "get_count": _get_count,
             "get_visitors": _get_visitors,

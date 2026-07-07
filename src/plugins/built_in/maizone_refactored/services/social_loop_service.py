@@ -131,6 +131,15 @@ class SocialLoopService:
                 except Exception as e:
                     logger.error(f"[计数门] 回赞轮次失败: {e}")
 
+            # --- 好友说说接话闭环 ---
+            # 放在计数门末尾无条件调用（自带 enable 开关与失败隔离）：追踪表里的已评论说说
+            # 需要按轮稳定轮询才能发现回复，故不依赖计数增量（且 comment 计数接口当前 404、
+            # 回退全量时也应照跑）；开关关闭时该方法会立即返回，成本可忽略。
+            try:
+                await self.qzone_service.check_comment_replies()
+            except Exception as e:
+                logger.error(f"[计数门] 好友说说接话轮次失败: {e}")
+
             # 仅当计数可用时，落盘本轮计数作为下次比较基准
             if isinstance(current, dict):
                 self.counts_store.set("data", current)

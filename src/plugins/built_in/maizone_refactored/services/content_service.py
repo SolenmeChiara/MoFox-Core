@@ -1075,6 +1075,181 @@ class ContentService:
             logger.error(f"生成空间回复时发生异常: {e}")
             return ""
 
+    async def generate_thread_reply(
+        self,
+        host_name: str,
+        host_qq: str | None,
+        story_content: str,
+        bot_comment: str,
+        replier_name: str,
+        reply_content: str,
+        replier_qq: str | None = None,
+    ) -> str | None:
+        """好友说说「接话闭环」：为楼里有人回复了 bot 评论的情形生成一句自然接话。
+
+        语境不同于回复自己说说：这里是**在好友（楼主）的说说下**，bot 先评论过，
+        对方（replier）在楼里回复了 bot，现在 bot 接话继续聊。
+
+        :param host_name: 楼主（说说作者）昵称
+        :param host_qq: 楼主 QQ（可空）
+        :param story_content: 说说原文（会摘要）
+        :param bot_comment: bot 之前在这条说说下的评论
+        :param replier_name: 回复者昵称
+        :param reply_content: 回复者对 bot 的回复内容
+        :param replier_qq: 回复者 QQ（可空，用于调取与 ta 的空间往事记忆）
+        :return: 形如 ``@回复者 正文`` 的接话文本；若判定是客套收尾无需接话 / 生成失败，返回 None。
+        """
+        try:
+            # 获取模型配置
+            models = llm_api.get_available_models()
+            text_model = str(self.get_config("models.text_model", "replyer"))
+            model_config = models.get(text_model)
+
+            if not model_config:
+                logger.error("未配置LLM模型")
+                return None
+
+            # 机器人人格三要素
+            bot_personality_core = config_api.get_global_config("personality.personality_core", "一个友好的机器人")
+            bot_personality_side = config_api.get_global_config("personality.personality_side", "")
+            bot_reply_style = config_api.get_global_config("personality.reply_style", "内容积极向上")
+
+            safety_guidelines = config_api.get_global_config("personality.safety_guidelines", [])
+
+            now = datetime.datetime.now()
+            current_time = now.strftime("%m月%d日 %H:%M")
+
+            # 关系信息 + 空间互动记忆（对「回复者」而非楼主；整体位于缓存断点之后的动态区）
+            relation_info = await self._get_relation_info(replier_name, replier_qq)
+
+            # 人设块（静态，缓存前缀）
+            personality_block = f"你的核心人格：{bot_personality_core}"
+            if bot_personality_side:
+                personality_block += f"\n你的人格侧面：{bot_personality_side}"
+            personality_block += f"\n你的表达方式：{bot_reply_style}"
+
+            # 互动规则块（静态）
+            safety_block = ""
+            if safety_guidelines:
+                safety_block = "\n\n# 互动规则\n\n" + "\n".join(f"- {rule}" for rule in safety_guidelines[:5])
+
+            # 楼主与回复者是否同一人（楼主本人来回复 bot 的场景，措辞需自然一些）
+            same_person = bool(replier_qq and host_qq and str(replier_qq) == str(host_qq))
+            scene_desc = (
+                f"你之前在{host_name}的说说下评论了一句，{replier_name}"
+                + ("（也就是楼主本人）" if same_person else "")
+                + "在楼里回复了你，现在你要接ta的话继续聊。"
+            )
+
+            # 说说原文摘要
+            story_summary = self._clean_truncated_content(story_content or "")
+            if len(story_summary) > 200:
+                story_summary = story_summary[:200] + "…"
+
+            # 缓存约定：人设 / 平台说明 / 固定指导（静态大块）在 CACHE_BREAKPOINT_MARKER 之前，
+            # 关系记忆 + 楼内动态上下文在标记之后。
+            prompt = f"""# 平台说明
+
+**QQ空间**是中国最流行的社交平台之一，类似于Facebook的"动态"或Instagram。用户发表"说说"，好友可以点赞、评论和回复，在评论楼里能你一句我一句地聊起来。
+
+# 人设定义
+
+{personality_block}
+{CACHE_BREAKPOINT_MARKER}
+# 用户关系
+
+{relation_info}{safety_block}
+
+# 当前场景
+
+- 时间: {current_time}
+- 场景: {scene_desc}
+
+# 说说原文（{host_name} 发的）
+
+{story_summary or "（无文字内容，可能是纯图片或转发）"}
+
+# 你之前的评论
+
+{bot_comment or "（内容缺失）"}
+
+# {replier_name} 对你的回复
+
+{reply_content or "（内容缺失）"}
+
+# 行为规范
+
+## 核心原则
+1. 自然接话，像真人在评论区你来我往，顺着对方的话往下聊
+2. 根据关系亲疏和过往互动调整语气，简短口语，控制在15-30字
+3. 可以回应观点、追问、轻松调侃或表达共鸣
+4. 保持人格与表达风格一致，不说教、不硬凑
+
+## 什么时候不必接话
+如果对方的回复只是纯客套收尾、没有可延续的内容（例如只有"哈哈""好的""嗯嗯""晚安""谢谢啦"之类），
+就没必要硬接，此时**只输出一个词：SKIP**（不要输出别的任何内容）。
+
+## 禁止事项
+- Emoji表情符号
+- 格式化标记
+- 敏感话题
+- "回复@xxx："这类前缀（@ 由系统自动补，你不要自己写）
+
+# 输出要求（最高优先级）
+
+- 想接话：只输出一条接话正文本身（一行，不带任何前后缀、不带引号、不带思考过程）。
+- 不想接：只输出 SKIP。"""
+
+            # 输出提示词到日志（青色）
+            logger.info(f"{PROMPT_HEADER_COLOR}{'='*50}{RESET_COLOR}")
+            logger.info(f"{PROMPT_HEADER_COLOR}  QQ空间接话提示词 - 楼主: {host_name} / 接: {replier_name}{RESET_COLOR}")
+            logger.info(f"{PROMPT_HEADER_COLOR}{'='*50}{RESET_COLOR}")
+            logger.info(f"{PROMPT_COLOR}{prompt}{RESET_COLOR}")
+            logger.info(f"{PROMPT_HEADER_COLOR}{'='*50} 提示词结束 {'='*50}{RESET_COLOR}")
+
+            success, reply, _, _ = await llm_api.generate_with_model(
+                prompt=prompt,
+                model_config=model_config,
+                request_type="maizone.qzone_thread_reply",
+                temperature=0.5,
+                max_tokens=8000,
+            )
+
+            if not success:
+                logger.error("生成空间接话失败")
+                return None
+
+            reply = (reply or "").strip()
+            if not reply:
+                return None
+
+            # 去掉可能的引号包裹
+            if len(reply) >= 2 and reply[0] == reply[-1] and reply[0] in ('"', "'"):
+                reply = reply[1:-1].strip()
+
+            # 容错识别 SKIP 标记（模型可能输出 SKIP / [SKIP] / "SKIP。" 等变体）
+            import re
+
+            skip_probe = re.sub(r"[\s\[\]（）()。.!！,，'\"]+", "", reply).upper()
+            if skip_probe == "SKIP" or not reply:
+                logger.info(f"[接话] 模型判定无需接话（对 {replier_name} 的客套收尾）")
+                return None
+
+            # 去掉模型自作主张写的 "回复@xxx：" / "@xxx：" 前缀（@ 由外层统一补）
+            reply = re.sub(r"^回复\s*@[^:：]+[：:]\s*", "", reply)
+            reply = re.sub(r"^@[^:：\s]+[：:]\s*", "", reply)
+            reply = reply.strip()
+            if not reply:
+                return None
+
+            reply_with_at = f"@{replier_name} {reply}"
+            logger.info(f"成功为'{replier_name}'生成接话（长度{len(reply_with_at)}）: '{reply_with_at}'")
+            return reply_with_at
+
+        except Exception as e:
+            logger.error(f"生成空间接话时发生异常: {e}")
+            return None
+
     async def _describe_image(self, image_url: str) -> str | None:
         """
         使用LLM识别图片内容。

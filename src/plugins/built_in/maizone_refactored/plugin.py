@@ -15,6 +15,7 @@ _background_tasks = set()
 from .actions.read_feed_action import ReadFeedAction
 from .actions.send_feed_action import SendFeedAction
 from .commands.send_feed_command import SendFeedCommand
+from .services.comment_tracking_service import CommentTrackingService
 from .services.content_service import ContentService
 from .services.cookie_service import CookieService
 from .services.image_service import ImageService
@@ -139,6 +140,22 @@ class MaiZoneRefactoredPlugin(BasePlugin):
                 type=int, default=3, description="检查点赞者时回看自己最近说说的条数"
             ),
         },
+        "comment_reply": {
+            "enable_comment_reply": ConfigField(
+                type=bool,
+                default=False,
+                description="是否启用好友说说「接话闭环」：追踪 bot 评论过的好友说说，发现有人回复 bot 评论后定向接话（默认关闭，观察后再手动开启）",
+            ),
+            "tracking_ttl_hours": ConfigField(
+                type=int, default=72, description="一条已评论好友说说追踪多久（小时），超时不再轮询回复"
+            ),
+            "max_replies_per_round": ConfigField(
+                type=int, default=3, description="单轮接话检查里最多接话的总次数（跨所有追踪说说）"
+            ),
+            "per_feed_reply_limit": ConfigField(
+                type=int, default=2, description="同一条说说里 bot 最多接话的次数（防无限对聊刷楼）"
+            ),
+        },
     }
 
     permission_nodes: list[PermissionNodeField] = [
@@ -158,6 +175,8 @@ class MaiZoneRefactoredPlugin(BasePlugin):
         image_service = ImageService(self.get_config)
         cookie_service = CookieService(self.get_config)
         reply_tracker_service = ReplyTrackerService()
+        # 好友说说接话闭环：追踪 bot 评论过的好友说说，供 QZoneService.check_comment_replies 轮询
+        comment_tracking_service = CommentTrackingService()
 
         qzone_service = QZoneService(
             self.get_config,
@@ -166,6 +185,7 @@ class MaiZoneRefactoredPlugin(BasePlugin):
             cookie_service,
             reply_tracker_service,
             person_memory=person_memory_service,
+            comment_tracking=comment_tracking_service,
         )
         scheduler_service = SchedulerService(self.get_config, qzone_service)
         # 社交闭环服务：计数门 + 访客回访 + 回赞，注入监控服务由其定时循环驱动
