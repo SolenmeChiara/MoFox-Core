@@ -186,14 +186,18 @@ class LLMUsageRecorder:
         time_cost: float,
     ):
         """实际执行数据库写入"""
-        # Anthropic prompt caching 修正：cache_read 只收 10%，cache_create 收 125%，其余按 100%
+        # Anthropic prompt caching 修正：cache_read 只收 10%，cache_create 按 TTL 倍率（1h=2.0x / 5m=1.25x），其余按 100%。
+        # 说明：这两个缓存字段目前仅 Anthropic 客户端填充（其余 provider 恒为 0），故倍率不会误伤非 anthropic 模型。
+        # 写入倍率随 anthropic_client.DEFAULT_CACHE_TTL 联动；函数内延迟导入以规避潜在循环导入。
+        from .model_client.anthropic_client import CACHE_WRITE_PRICE_MULTIPLIER
+
         cache_read = model_usage.cache_read_tokens or 0
         cache_create = model_usage.cache_creation_tokens or 0
         non_cache_input = max(0, (model_usage.prompt_tokens or 0) - cache_read - cache_create)
         input_cost = (
             non_cache_input / 1000000 * model_info.price_in
             + cache_read / 1000000 * model_info.price_in * 0.10
-            + cache_create / 1000000 * model_info.price_in * 1.25
+            + cache_create / 1000000 * model_info.price_in * CACHE_WRITE_PRICE_MULTIPLIER
         )
         output_cost = (model_usage.completion_tokens / 1000000) * model_info.price_out
         total_cost = round(input_cost + output_cost, 6)

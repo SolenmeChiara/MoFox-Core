@@ -39,6 +39,9 @@ logger = get_logger("Anthropic客户端")
 
 ANTHROPIC_VERSION = "2023-06-01"
 DEFAULT_CACHE_TTL = "1h"  # 1h TTL：写入费 2x（5m 为 1.25x）但读只要 0.1x，bot 流量稀疏（间隔常超 5 分钟）时更划算；如需改回填 "5m"
+# 缓存写入的计费倍率随上面的 TTL 联动：1h TTL 写入按 2.0x 基础输入价，5m TTL 为 1.25x（缓存读取恒为 0.1x）。
+# 成本核算（utils.py）延迟导入此常量，改 TTL 时无需再手动同步倍率。
+CACHE_WRITE_PRICE_MULTIPLIER = 2.0 if DEFAULT_CACHE_TTL == "1h" else 1.25
 MAX_CACHE_BREAKPOINTS = 4  # Anthropic 单次请求最多允许 4 个 cache_control 断点
 
 # —— 缓存保活（keep-alive）——
