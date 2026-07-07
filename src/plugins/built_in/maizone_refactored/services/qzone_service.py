@@ -9,7 +9,7 @@ import random
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import aiofiles
 import aiohttp
@@ -24,6 +24,9 @@ from .content_service import ContentService
 from .cookie_service import CookieService
 from .image_service import ImageService
 from .reply_tracker_service import ReplyTrackerService
+
+if TYPE_CHECKING:
+    from .person_memory_service import PersonMemoryService
 
 logger = get_logger("MaiZone.QZoneService")
 
@@ -48,6 +51,7 @@ class QZoneService:
         image_service: ImageService,
         cookie_service: CookieService,
         reply_tracker: ReplyTrackerService | None = None,
+        person_memory: "PersonMemoryService | None" = None,
     ):
         self.get_config = get_config
         self.content_service = content_service
@@ -55,6 +59,8 @@ class QZoneService:
         self.cookie_service = cookie_service
         # 如果没有提供 reply_tracker 实例，则创建一个新的
         self.reply_tracker = reply_tracker if reply_tracker is not None else ReplyTrackerService()
+        # 空间人物记忆服务（可选）：负责把互动对象注册进记人系统并积累空间互动记录
+        self.person_memory = person_memory
         # 用于防止并发回复/评论的内存锁
         self.processing_comments = set()
 
@@ -481,6 +487,14 @@ class QZoneService:
                     if success:
                         self.reply_tracker.mark_as_replied(fid, comment_tid)
                         logger.info(f"成功回复'{nickname}'的评论: '{reply_content}'")
+                        # 记人：注册评论者并积累一条空间互动记录（失败不影响主流程）
+                        await self._remember_interaction(
+                            qq=commenter_qq,
+                            nickname=nickname,
+                            interaction_type="回复了ta在你说说下的评论",
+                            their_content=comment_content,
+                            bot_reply=reply_content,
+                        )
                     else:
                         logger.error(f"回复'{nickname}'的评论失败")
                     await asyncio.sleep(random.uniform(10, 20))
@@ -655,6 +669,14 @@ class QZoneService:
                         self.reply_tracker.mark_as_replied(fid, "main_comment")
                         logger.info(f"成功评论'{target_name}'的说说: '{comment_text}'")
                         result["commented"] = True
+                        # 记人：注册对方并积累一条空间互动记录（失败不影响主流程）
+                        await self._remember_interaction(
+                            qq=target_qq,
+                            nickname=target_name,
+                            interaction_type="评论了ta的说说",
+                            their_content=content or rt_con or "",
+                            bot_reply=comment_text,
+                        )
                     else:
                         logger.error(f"评论'{target_name}'的说说失败")
             except Exception as e:
@@ -678,6 +700,32 @@ class QZoneService:
             logger.debug(f"概率未命中，跳过点赞: probability={like_probability}")
 
         return result
+
+    async def _remember_interaction(
+        self,
+        qq: str | int | None,
+        nickname: str | None,
+        interaction_type: str,
+        their_content: str | None,
+        bot_reply: str | None,
+    ) -> None:
+        """把一次成功的空间互动接入记人系统：注册对方 + 追加互动记录。
+
+        整体包裹 try/except，任何失败只告警，绝不影响评论 / 回复主流程。
+        """
+        if self.person_memory is None or not qq:
+            return
+        try:
+            await self.person_memory.register_person(qq, nickname)
+            self.person_memory.add_interaction(
+                qq=qq,
+                nickname=nickname,
+                interaction_type=interaction_type,
+                their_content=their_content,
+                bot_reply=bot_reply,
+            )
+        except Exception as e:
+            logger.warning(f"记录空间互动记忆失败(qq={qq}): {e}")
 
     def _generate_gtk(self, skey: str) -> str:
         hash_val = 5381

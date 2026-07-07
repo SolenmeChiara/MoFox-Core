@@ -7,9 +7,13 @@ import asyncio
 import base64
 import datetime
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 import aiohttp
 import filetype
+
+if TYPE_CHECKING:
+    from .person_memory_service import PersonMemoryService
 
 from src.common.logger import get_logger
 from src.llm_models.payload_content.message import CACHE_BREAKPOINT_MARKER
@@ -32,13 +36,15 @@ class ContentService:
     内容服务类，封装了所有与大语言模型（LLM）交互以生成文本的逻辑。
     """
 
-    def __init__(self, get_config: Callable):
+    def __init__(self, get_config: Callable, person_memory: "PersonMemoryService | None" = None):
         """
         初始化内容服务。
 
         :param get_config: 一个函数，用于从插件主类获取配置信息。
+        :param person_memory: 空间人物记忆服务（可选），用于在生成评论/回复时调取对方的空间互动往事。
         """
         self.get_config = get_config
+        self.person_memory = person_memory
 
     async def generate_story(self, topic: str, context: str | None = None) -> str:
         """
@@ -387,6 +393,14 @@ class ContentService:
         :param target_qq: 用户QQ号（可选，如果有则优先使用）
         :return: 格式化的关系信息文本
         """
+        # 空间互动记忆块：整体位于缓存断点之后的动态区，追加到关系信息末尾、候选内容之前
+        memory_block = ""
+        if self.person_memory is not None:
+            try:
+                memory_block = self.person_memory.get_interaction_block(target_qq, target_name)
+            except Exception as e:
+                logger.warning(f"获取空间互动记忆失败: {e}")
+
         try:
             # 获取 person_id
             person_id = None
@@ -396,7 +410,8 @@ class ContentService:
                 person_id = await person_api.get_person_id_by_name(target_name)
 
             if not person_id:
-                return f"你对{target_name}不太熟悉，这可能是第一次看到ta的空间。"
+                base = f"你对{target_name}不太熟悉，这可能是第一次看到ta的空间。"
+                return f"{base}\n\n{memory_block}" if memory_block else base
 
             # 并行获取用户信息
             info, impression, points = await asyncio.gather(
@@ -439,11 +454,13 @@ class ContentService:
                 memory_points = [f"{p[0]}" for p in points[:2]]
                 relation_parts.append(f"- 你记得关于ta的一些事：{'; '.join(memory_points)}")
 
-            return "\n".join(relation_parts)
+            relation_text = "\n".join(relation_parts)
+            return f"{relation_text}\n\n{memory_block}" if memory_block else relation_text
 
         except Exception as e:
             logger.warning(f"获取用户关系信息失败: {e}")
-            return f"你对{target_name}的了解有限。"
+            base = f"你对{target_name}的了解有限。"
+            return f"{base}\n\n{memory_block}" if memory_block else base
 
     def _clean_truncated_content(self, content: str) -> str:
         """

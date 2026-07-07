@@ -20,6 +20,7 @@ from .services.cookie_service import CookieService
 from .services.image_service import ImageService
 from .services.manager import register_service
 from .services.monitor_service import MonitorService
+from .services.person_memory_service import PersonMemoryService
 from .services.qzone_service import QZoneService
 from .services.reply_tracker_service import ReplyTrackerService
 from .services.scheduler_service import SchedulerService
@@ -99,6 +100,16 @@ class MaiZoneRefactoredPlugin(BasePlugin):
         "cross_context": {
             "user_id": ConfigField(type=str, default="", description="用于获取互通上下文的目标用户QQ号"),
         },
+        "person_memory": {
+            "enable_person_memory": ConfigField(
+                type=bool,
+                default=True,
+                description="是否把空间互动对象注册进记人系统，并积累/调取空间互动记忆",
+            ),
+            "max_interaction_records": ConfigField(
+                type=int, default=20, description="每个用户保留的空间互动记录条数上限"
+            ),
+        },
     }
 
     permission_nodes: list[PermissionNodeField] = [
@@ -112,7 +123,9 @@ class MaiZoneRefactoredPlugin(BasePlugin):
     async def on_plugin_loaded(self):
         """插件加载完成后的回调，初始化服务并启动后台任务"""
         # --- 创建并注册所有服务实例 ---
-        content_service = ContentService(self.get_config)
+        # 空间人物记忆服务：注册互动对象进记人系统 + 积累/调取空间互动记忆
+        person_memory_service = PersonMemoryService(self.get_config)
+        content_service = ContentService(self.get_config, person_memory=person_memory_service)
         image_service = ImageService(self.get_config)
         cookie_service = CookieService(self.get_config)
         reply_tracker_service = ReplyTrackerService()
@@ -123,6 +136,7 @@ class MaiZoneRefactoredPlugin(BasePlugin):
             image_service,
             cookie_service,
             reply_tracker_service,
+            person_memory=person_memory_service,
         )
         scheduler_service = SchedulerService(self.get_config, qzone_service)
         monitor_service = MonitorService(self.get_config, qzone_service)
