@@ -1589,11 +1589,13 @@ class QZoneService:
                     raise RuntimeError(f"QQ空间API错误: {error_message} (错误码: {error_code})")
 
                 feeds_list = []
-                my_name = json_data.get("logininfo", {}).get("name", "")
-                total_msgs = len(json_data.get("msglist", []))
+                my_name = (json_data.get("logininfo") or {}).get("name", "")
+                # 空间无内容/不可见时接口返回 "msglist": null，get 的默认值不生效
+                msglist = json_data.get("msglist") or []
+                total_msgs = len(msglist)
                 logger.debug(f"[DEBUG] 从API获取到 {total_msgs} 条原始说说")
 
-                for idx, msg in enumerate(json_data.get("msglist", [])):
+                for idx, msg in enumerate(msglist):
                     msg_tid = msg.get("tid", "")
                     msg_content = msg.get("content", "")
                     msg_rt_con = msg.get("rt_con")
