@@ -24,6 +24,7 @@ from .services.person_memory_service import PersonMemoryService
 from .services.qzone_service import QZoneService
 from .services.reply_tracker_service import ReplyTrackerService
 from .services.scheduler_service import SchedulerService
+from .services.social_loop_service import SocialLoopService
 
 logger = get_logger("MaiZone.Plugin")
 
@@ -110,6 +111,34 @@ class MaiZoneRefactoredPlugin(BasePlugin):
                 type=int, default=20, description="每个用户保留的空间互动记录条数上限"
             ),
         },
+        "social_loop": {
+            "enable_unread_gate": ConfigField(
+                type=bool,
+                default=True,
+                description="未读计数事件门：仅当计数有增量时才跑对应重活（计数接口失败则回退全量，不影响监控）",
+            ),
+            "enable_visitor_callback": ConfigField(type=bool, default=True, description="是否启用访客回访闭环"),
+            "visitor_callback_cooldown_hours": ConfigField(
+                type=int, default=24, description="同一访客多久内不重复回访（小时）"
+            ),
+            "visitor_callback_max_per_round": ConfigField(
+                type=int, default=2, description="每轮最多回访的新访客数"
+            ),
+            "visitor_callback_delay_min_seconds": ConfigField(
+                type=int, default=5, description="回访前随机延迟下限（秒），模拟真人节奏"
+            ),
+            "visitor_callback_delay_max_seconds": ConfigField(
+                type=int, default=30, description="回访前随机延迟上限（秒），模拟真人节奏"
+            ),
+            "enable_like_back": ConfigField(type=bool, default=True, description="是否启用回赞闭环"),
+            "like_back_cooldown_hours": ConfigField(
+                type=int, default=48, description="同一点赞者多久内不重复回赞（小时）"
+            ),
+            "like_back_max_per_round": ConfigField(type=int, default=3, description="每轮最多回赞的新点赞者数"),
+            "like_back_recent_feed_count": ConfigField(
+                type=int, default=3, description="检查点赞者时回看自己最近说说的条数"
+            ),
+        },
     }
 
     permission_nodes: list[PermissionNodeField] = [
@@ -139,7 +168,13 @@ class MaiZoneRefactoredPlugin(BasePlugin):
             person_memory=person_memory_service,
         )
         scheduler_service = SchedulerService(self.get_config, qzone_service)
-        monitor_service = MonitorService(self.get_config, qzone_service)
+        # 社交闭环服务：计数门 + 访客回访 + 回赞，注入监控服务由其定时循环驱动
+        social_loop_service = SocialLoopService(
+            self.get_config, qzone_service, person_memory=person_memory_service
+        )
+        monitor_service = MonitorService(
+            self.get_config, qzone_service, social_loop_service=social_loop_service
+        )
 
         register_service("qzone", qzone_service)
         register_service("reply_tracker", reply_tracker_service)

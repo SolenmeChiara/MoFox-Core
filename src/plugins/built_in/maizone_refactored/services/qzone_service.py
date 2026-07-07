@@ -31,6 +31,25 @@ if TYPE_CHECKING:
 logger = get_logger("MaiZone.QZoneService")
 
 
+def _loads_lenient(text: str) -> Any:
+    """容忍 ``_Callback(...)`` / jsonp 包裹以及 ``undefined`` 的宽松 JSON 解析。
+
+    QZone 的部分只读接口（访客、计数、点赞名单）会用回调函数包裹 JSON 返回，
+    这里统一剥离包裹再交给 orjson 解析。解析失败向上抛出，由调用方兜底为 None/[]。
+    """
+    t = text.strip()
+    for prefix in ("_Callback(", "callback(", "_preloadCallback("):
+        if t.startswith(prefix):
+            t = t[len(prefix) :]
+            if t.endswith(");"):
+                t = t[:-2]
+            elif t.endswith(")"):
+                t = t[:-1]
+            break
+    t = t.replace("undefined", "null")
+    return orjson.loads(t)
+
+
 class QZoneService:
     """
     QQ空间服务类，负责所有API交互和业务流程编排。
@@ -43,6 +62,13 @@ class QZoneService:
     COMMENT_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_re_feeds"
     LIST_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qq.com/cgi-bin/emotion_cgi_msglist_v6"
     REPLY_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_re_feeds"
+    # 只读社交接口（社交闭环功能：计数门 / 访客回访 / 回赞）
+    # 访客列表：已只读实测可用（走 user.qzone 代理域，返回 _Callback 包裹的 JSON，code=0）
+    VISITOR_URL = "https://user.qzone.qq.com/proxy/domain/g.qzone.qq.com/cgi-bin/friendshow/cgi_get_visitor_more"
+    # 未读计数：轻量事件门用（实测该 URL 目前返回 404，失败时整体回退全量，绝不影响监控）
+    COUNT_URL = "https://mobile.qzone.qq.com/get_count"
+    # 点赞名单：拉自己说说的点赞者（失败则跳过回赞，不影响主流程）
+    LIKE_LIST_URL = "https://user.qzone.qq.com/proxy/domain/r.qzone.qq.com/cgi-bin/likes/get_like_list_app"
 
     def __init__(
         self,
@@ -726,6 +752,97 @@ class QZoneService:
             )
         except Exception as e:
             logger.warning(f"记录空间互动记忆失败(qq={qq}): {e}")
+
+    # --- 社交闭环只读能力（计数门 / 访客回访 / 回赞）---
+    # 这些方法为 SocialLoopService 提供数据，全部失败隔离：任何异常都返回 None/[]，
+    # 由上层决定「回退全量」或「跳过本轮」，绝不向监控主流程抛异常。
+
+    async def get_unread_counts(self) -> dict | None:
+        """获取 QQ 空间未读计数（轻量事件门用）。
+
+        :return: 形如 ``{"feed": int, "comment": int, "visitor": int, "like": int}``；
+                 任何失败（网络/解析/接口404）都返回 ``None``，调用方据此回退到全量执行。
+        """
+        try:
+            qq_account = config_api.get_global_config("bot.qq_account", "")
+            api_client = await self._get_api_client(qq_account, None)
+            if not api_client:
+                return None
+            return await api_client["get_count"]()
+        except Exception as e:
+            logger.debug(f"获取未读计数异常（将回退全量）: {e}")
+            return None
+
+    async def get_visitors(self) -> list[dict]:
+        """获取空间访客列表。
+
+        :return: ``[{"uin": str, "name": str, "time": int}, ...]``；失败返回空列表。
+        """
+        try:
+            qq_account = config_api.get_global_config("bot.qq_account", "")
+            api_client = await self._get_api_client(qq_account, None)
+            if not api_client:
+                return []
+            return await api_client["get_visitors"]()
+        except Exception as e:
+            logger.error(f"获取访客列表异常: {e}")
+            return []
+
+    async def get_recent_likers(self, feed_count: int = 3) -> list[dict]:
+        """获取自己最近 ``feed_count`` 条说说的点赞者（跨说说去重合并）。
+
+        :return: ``[{"uin": str, "name": str}, ...]``；失败返回空列表。
+        """
+        try:
+            qq_account = config_api.get_global_config("bot.qq_account", "")
+            api_client = await self._get_api_client(qq_account, None)
+            if not api_client:
+                return []
+            own_feeds = await api_client["list_feeds"](str(qq_account), max(1, feed_count))
+            if not own_feeds:
+                return []
+            seen: dict[str, str] = {}
+            for feed in own_feeds:
+                fid = feed.get("tid", "")
+                if not fid:
+                    continue
+                likers = await api_client["get_likers"](fid)
+                for lk in likers:
+                    u = lk.get("uin")
+                    if u and u not in seen:
+                        seen[u] = lk.get("name", "") or ""
+                # 名单接口之间留出间隔，降低风控风险
+                await asyncio.sleep(random.uniform(2, 4))
+            return [{"uin": u, "name": n} for u, n in seen.items()]
+        except Exception as e:
+            logger.error(f"获取最近点赞者异常: {e}")
+            return []
+
+    async def like_user_latest_feed(self, target_qq: str | int) -> dict:
+        """给指定用户的最新一条说说点赞（只点赞不评论，用于回赞轻接触）。
+
+        :return: ``{"success": bool, "tid": str, "message": str}``。
+        """
+        try:
+            qq_account = config_api.get_global_config("bot.qq_account", "")
+            api_client = await self._get_api_client(qq_account, None)
+            if not api_client:
+                return {"success": False, "tid": "", "message": "获取API客户端失败"}
+            # 取几条以规避 _list_feeds 对已评论好友说说的过滤，取其中最新可见的一条
+            feeds = await api_client["list_feeds"](str(target_qq), 3)
+            if not feeds:
+                return {"success": False, "tid": "", "message": "对方没有可见说说"}
+            fid = feeds[0].get("tid", "")
+            if not fid:
+                return {"success": False, "tid": "", "message": "最新说说无有效tid"}
+            ok = await api_client["like"](str(target_qq), fid)
+            return {"success": bool(ok), "tid": fid, "message": "点赞成功" if ok else "点赞失败"}
+        except RuntimeError as e:
+            # QQ空间业务错误（含 Cookie 失效），交由上层记录，不抛出
+            return {"success": False, "tid": "", "message": str(e)}
+        except Exception as e:
+            logger.error(f"给用户 {target_qq} 最新说说点赞异常: {e}")
+            return {"success": False, "tid": "", "message": f"异常: {e}"}
 
     def _generate_gtk(self, skey: str) -> str:
         hash_val = 5381
@@ -1517,7 +1634,119 @@ class QZoneService:
                 logger.error(f"监控好友动态失败: {e}")
                 return []
 
-        logger.debug("API客户端构造完成，返回包含6个方法的字典")
+        async def _get_count() -> dict | None:
+            """获取未读计数（新访客/新评论/新赞/新动态）。字段名做防御性多候选取值。
+
+            实测该端点当前返回 404；此处保留完整实现并在任何失败时返回 None，
+            由调用方回退到「全量执行」，因此接口不可用也不会影响监控。
+            """
+            try:
+                params = {"uin": uin, "g_tk": gtk, "format": "json"}
+                res_text = await _request("GET", self.COUNT_URL, params=params)
+                data = _loads_lenient(res_text)
+                if not isinstance(data, dict):
+                    return None
+                # 计数可能直接在顶层，也可能在 data 子级
+                payload = data.get("data") if isinstance(data.get("data"), dict) else data
+
+                def _pick(*keys: str) -> int:
+                    for k in keys:
+                        v = payload.get(k)
+                        if isinstance(v, bool):
+                            continue
+                        if isinstance(v, (int, float)):
+                            return int(v)
+                        if isinstance(v, str) and v.strip().isdigit():
+                            return int(v)
+                    return 0
+
+                return {
+                    "feed": _pick("newfeeds", "unreadfeeds", "feed", "feedcount", "friendfeeds"),
+                    "comment": _pick("commentcount", "newcomment", "comment", "replycount"),
+                    "visitor": _pick("newvisitornum", "newvisitor", "visitorcount", "visitor", "visit"),
+                    "like": _pick("likecount", "newlike", "like", "praise", "praisecount"),
+                }
+            except Exception as e:
+                logger.debug(f"获取未读计数失败（将回退全量）: {e}")
+                return None
+
+        async def _get_visitors(page: int = 1) -> list[dict]:
+            """拉取空间访客列表（已只读实测：走代理域，_Callback 包裹，code=0）。
+
+            返回 ``[{"uin": str, "name": str, "time": int}, ...]``；失败返回空列表。
+            """
+            try:
+                params = {"uin": uin, "mask": 2, "g_tk": gtk, "page": page, "fupdate": 1, "clear": 1}
+                res_text = await _request("GET", self.VISITOR_URL, params=params)
+                data = _loads_lenient(res_text)
+                if not isinstance(data, dict) or data.get("code") != 0:
+                    code = data.get("code") if isinstance(data, dict) else "N/A"
+                    logger.warning(f"获取访客列表返回异常: code={code}")
+                    return []
+                inner = data.get("data") if isinstance(data.get("data"), dict) else {}
+                items = inner.get("items") or []
+                visitors: list[dict] = []
+                for it in items:
+                    if not isinstance(it, dict):
+                        continue
+                    v_uin = it.get("uin")
+                    if not v_uin:
+                        continue
+                    visitors.append(
+                        {
+                            "uin": str(v_uin),
+                            "name": it.get("name", "") or "",
+                            "time": int(it.get("time", 0) or 0),
+                        }
+                    )
+                logger.debug(f"获取到 {len(visitors)} 条访客记录")
+                return visitors
+            except Exception as e:
+                logger.error(f"获取访客列表失败: {e}")
+                return []
+
+        async def _get_likers(feed_id: str) -> list[dict]:
+            """获取某条自己说说的点赞者名单。返回 ``[{"uin": str, "name": str}, ...]``；失败返回空列表。
+
+            使用与点赞相同的 mood unikey；点赞名单字段做多候选防御性取值。
+            """
+            try:
+                unikey = f"http://user.qzone.qq.com/{uin}/mood/{feed_id}"
+                params = {
+                    "uin": uin,
+                    "unikey": unikey,
+                    "begin_uin": 0,
+                    "query_count": 60,
+                    "if_first_page": 1,
+                    "fupdate": 1,
+                    "g_tk": gtk,
+                }
+                res_text = await _request("GET", self.LIKE_LIST_URL, params=params)
+                data = _loads_lenient(res_text)
+                if not isinstance(data, dict):
+                    return []
+                inner = data.get("data") if isinstance(data.get("data"), dict) else data
+                raw = None
+                for key in ("like_uin_info", "likemans", "info", "list"):
+                    if isinstance(inner.get(key), list):
+                        raw = inner[key]
+                        break
+                if raw is None:
+                    return []
+                likers: list[dict] = []
+                for it in raw:
+                    if not isinstance(it, dict):
+                        continue
+                    l_uin = it.get("fuin") or it.get("uin")
+                    if not l_uin:
+                        continue
+                    likers.append({"uin": str(l_uin), "name": it.get("nick") or it.get("name") or ""})
+                return likers
+            except Exception as e:
+                logger.debug(f"获取点赞者名单失败: {e}")
+                return []
+
+        logger.debug("API客户端构造完成，返回包含9个方法的字典")
         return {
             "publish": _publish,
             "list_feeds": _list_feeds,
@@ -1525,4 +1754,7 @@ class QZoneService:
             "like": _like,
             "reply": _reply,
             "monitor_list_feeds": _monitor_list_feeds,
+            "get_count": _get_count,
+            "get_visitors": _get_visitors,
+            "get_likers": _get_likers,
         }

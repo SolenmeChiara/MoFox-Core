@@ -5,10 +5,14 @@
 import asyncio
 import traceback
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 from src.common.logger import get_logger
 
 from .qzone_service import QZoneService
+
+if TYPE_CHECKING:
+    from .social_loop_service import SocialLoopService
 
 logger = get_logger("MaiZone.MonitorService")
 
@@ -16,9 +20,16 @@ logger = get_logger("MaiZone.MonitorService")
 class MonitorService:
     """好友动态监控服务"""
 
-    def __init__(self, get_config: Callable, qzone_service: QZoneService):
+    def __init__(
+        self,
+        get_config: Callable,
+        qzone_service: QZoneService,
+        social_loop_service: "SocialLoopService | None" = None,
+    ):
         self.get_config = get_config
         self.qzone_service = qzone_service
+        # 社交闭环服务：承载「计数门 + 访客回访 + 回赞」的编排。为空时退回原始全量监控。
+        self.social_loop_service = social_loop_service
         self.is_running = False
         self.task = None
 
@@ -56,7 +67,12 @@ class MonitorService:
 
                 interval_minutes = self.get_config("monitor.interval_minutes", 10)
 
-                await self.qzone_service.monitor_feeds()
+                # 优先走「计数门」编排（计数门内部会在有增量时调用 monitor_feeds/访客回访/回赞，
+                # 计数不可用时回退全量）；未注入 social_loop 时退回原始全量监控，保证向后兼容。
+                if self.social_loop_service is not None:
+                    await self.social_loop_service.run_gated_round()
+                else:
+                    await self.qzone_service.monitor_feeds()
 
                 logger.info(f"本轮监控完成，将在 {interval_minutes} 分钟后进行下一次检查。")
                 await asyncio.sleep(interval_minutes * 60)
