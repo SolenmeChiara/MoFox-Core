@@ -1,5 +1,6 @@
 import base64
 import io
+import re
 from enum import Enum
 
 from PIL import Image
@@ -22,6 +23,20 @@ SUPPORTED_IMAGE_FORMATS = ["jpg", "jpeg", "png", "webp", "gif"]  # openai支持�
 #   使静态前缀（系统提示词 + 人设等）能命中 Anthropic 的 prompt cache；
 # - 其他客户端（openai/gemini/bedrock）在发送前会把该标记原样移除，不影响提示词内容。
 CACHE_BREAKPOINT_MARKER = "<<<MOFOX_CACHE_BREAKPOINT>>>"
+
+# 按需看图（view_image）占位标记。
+# 渲染层（chat_message_builder）在被 planner "钉住"的图片描述之后追加 <<<MOFOX_IMAGE:image_id>>>；
+# utils_model 在把 prompt 发送给模型前，按此标记把对应图片展开为真实的图片内容块（混合内容 Message），
+# 使被选中查看的图片能在同一轮 replyer 的 prompt 中以图片形式出现。描述文字保留在标记之前，作展开失败时的回退。
+IMAGE_PLACEHOLDER_PREFIX = "<<<MOFOX_IMAGE:"
+IMAGE_PLACEHOLDER_SUFFIX = ">>>"
+# 捕获组为 image_id；re.split 会得到 [文本, image_id, 文本, image_id, ..., 文本] 交替序列
+IMAGE_PLACEHOLDER_PATTERN = re.compile(r"<<<MOFOX_IMAGE:([^>]+)>>>")
+
+
+def format_image_placeholder(image_id: str) -> str:
+    """构造按需看图占位标记。"""
+    return f"{IMAGE_PLACEHOLDER_PREFIX}{image_id}{IMAGE_PLACEHOLDER_SUFFIX}"
 
 
 class Message:

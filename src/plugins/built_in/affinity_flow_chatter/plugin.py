@@ -94,4 +94,12 @@ class AffinityChatterPlugin(BasePlugin):
         except Exception as e:
             logger.error(f"加载 RespondAction 时出错: {e}")
 
+        try:
+            # 延迟导入 ViewImageAction（AFC 专属：按需看图）
+            from .actions.view_image import ViewImageAction
+
+            components.append((ViewImageAction.get_action_info(), ViewImageAction))
+        except Exception as e:
+            logger.error(f"加载 ViewImageAction 时出错: {e}")
+
         return components

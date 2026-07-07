@@ -13,6 +13,7 @@ from json_repair import repair_json
 
 from src.chat.utils.chat_message_builder import (
     build_readable_messages_with_id,
+    render_pic_ids_in_text,
 )
 from src.chat.utils.prompt import global_prompt_manager
 from src.common.data_models.info_data_model import ActionPlannerInfo, Plan
@@ -502,6 +503,7 @@ class ChatterPlanFilter:
                     timestamp_mode="normal_no_YMD",
                     truncate=False,
                     show_actions=False,
+                    show_pic_ids=True,  # 让 planner 看到 [图片id:xxx 描述]，可据此选择 view_image
                 )
                 read_history_block = f"{read_content}"
             else:
@@ -566,6 +568,8 @@ class ChatterPlanFilter:
                         sender_name = f"{role_prefix}{display_name}"
 
                     msg_content = msg.get("processed_plain_text", "")
+                    # 未读消息里的图片同样渲染为 [图片id:xxx 描述]，供 planner 对刚到达的图片选择 view_image
+                    msg_content = await render_pic_ids_in_text(msg_content, show_pic_ids=True)
 
                     # 获取兴趣度信息并显示在提示词中
                     interest_score = interest_scores.get(real_msg_id, 0.0)

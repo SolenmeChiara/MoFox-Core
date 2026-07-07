@@ -15,7 +15,10 @@ from src.chat.express.expression_selector import expression_selector
 from src.chat.message_receive.uni_message_sender import HeartFCSender
 from src.chat.utils.chat_message_builder import (
     build_readable_messages,
+    collect_pic_ids_from_context,
     get_raw_msg_before_timestamp_with_chat,
+    prune_pinned_images,
+    render_pic_ids_in_text,
     replace_user_references_async,
 )
 
@@ -944,6 +947,11 @@ class DefaultReplyer:
                 read_messages = stream_context.history_messages  # 已读消息（已从数据库加载）
                 unread_messages = stream_context.get_unread_messages()  # 未读消息
 
+                # 按需看图：计算本轮需以真实图片形式注入的"钉住"图片集合，并做滚窗自愈（落窗的自动剔除）
+                window_pic_ids = collect_pic_ids_from_context(stream_context)
+                prune_pinned_images(stream_context.pinned_images, window_pic_ids)
+                pinned_image_ids = set(stream_context.pinned_images.keys())
+
                 # 构建已读历史消息 prompt
                 read_history_prompt = ""
                 if read_messages:
@@ -959,6 +967,7 @@ class DefaultReplyer:
                         replace_bot_name=True,
                         timestamp_mode="normal_no_YMD",
                         truncate=True,
+                        pinned_image_ids=pinned_image_ids,
                     )
                     read_history_prompt = f"这是已读历史消息，仅作为当前聊天情景的参考：\n{read_content}"
                     logger.debug(f"使用内存中的 {len(final_history)} 条历史消息构建prompt")
@@ -973,6 +982,11 @@ class DefaultReplyer:
                     for msg in unread_messages:
                         msg_time = time.strftime("%H:%M:%S", time.localtime(msg.time))
                         msg_content = msg.processed_plain_text
+                        # 未读里的图片渲染为 [图片：描述]；若被钉住则追加展开锚点，供本轮以真实图片注入
+                        if msg_content:
+                            msg_content = await render_pic_ids_in_text(
+                                msg_content, pinned_image_ids=pinned_image_ids
+                            )
 
                         # 使用与已读历史消息相同的方法获取用户名
                         from src.person_info.person_info import PersonInfoManager, get_person_info_manager

@@ -67,16 +67,27 @@ class ChatterPlanExecutor:
         logger.info(f"选择动作: {', '.join(action_types) if action_types else '无'}")
 
         execution_results = []
+        pre_actions = []
         reply_actions = []
         other_actions = []
 
-        # 分类动作：回复动作和其他动作
-        # 回复类动作包括：reply, proactive_reply, respond
+        # 分类动作：前置动作、回复动作和其他动作
+        # - 前置动作（view_image）：必须在回复生成之前 await 完成，
+        #   以便同一轮 replyer 构建 prompt 时就能看到被钉住的真实图片
+        # - 回复类动作：reply, proactive_reply, respond
         for action_info in plan.decided_actions:
-            if action_info.action_type in ["reply", "proactive_reply", "respond"]:
+            if action_info.action_type == "view_image":
+                pre_actions.append(action_info)
+            elif action_info.action_type in ["reply", "proactive_reply", "respond"]:
                 reply_actions.append(action_info)
             else:
                 other_actions.append(action_info)
+
+        # 前置动作：串行 await 完成后再进入回复，保证同轮可见
+        if pre_actions:
+            pre_result = await self._execute_other_actions(pre_actions, plan)
+            execution_results.extend(pre_result["results"])
+            logger.info(f"已完成 {len(pre_actions)} 个前置动作（view_image）。")
 
         # 执行回复动作（优先执行）
         if reply_actions:

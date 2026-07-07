@@ -37,7 +37,13 @@ from src.config.config import model_config
 
 from .exceptions import NetworkConnectionError, ReqAbortException, RespNotOkException, RespParseException
 from .model_client.base_client import APIResponse, BaseClient, UsageRecord, client_registry
-from .payload_content.message import CACHE_BREAKPOINT_MARKER, Message, MessageBuilder, RoleType
+from .payload_content.message import (
+    CACHE_BREAKPOINT_MARKER,
+    IMAGE_PLACEHOLDER_PATTERN,
+    Message,
+    MessageBuilder,
+    RoleType,
+)
 from .payload_content.system_prompt import SYSTEM_PROMPT
 from .payload_content.tool_option import ToolCall, ToolOption, ToolOptionBuilder
 from .utils import compress_messages, llm_usage_recorder
@@ -804,6 +810,9 @@ class _RequestStrategy:
         max_attempts = len(self.model_list)
         last_exception: Exception | None = None
 
+        # image_id -> (format, base64) 或 None（缺失/读取失败）；failover 重试复用，避免重复读盘
+        image_b64_cache: dict[str, tuple[str, str] | None] = {}
+
         for attempt in range(max_attempts):
             selection_result = await self.model_selector.select_best_available_model(
                 failed_models_in_this_request, str(request_type.value)
@@ -823,9 +832,7 @@ class _RequestStrategy:
                     processed_prompt = await self.prompt_processor.prepare_prompt(
                         prompt, model_info, self.task_name
                     )
-                    # 缓存断点标记只有 anthropic 客户端能识别，其他客户端发送前原样移除
-                    if api_provider.client_type != "anthropic" and CACHE_BREAKPOINT_MARKER in processed_prompt:
-                        processed_prompt = processed_prompt.replace(CACHE_BREAKPOINT_MARKER, "")
+                    is_anthropic = api_provider.client_type == "anthropic"
                     message_list = []
                     if self.system_prompt:
                         system_message = (
@@ -836,7 +843,11 @@ class _RequestStrategy:
                         )
                         message_list.append(system_message)
 
-                    user_message = MessageBuilder().add_text_content(processed_prompt).build()
+                    # 按需看图：若 prompt 内含图片占位标记，则展开为图文混合消息；否则走原纯文本路径。
+                    # 缓存断点标记（仅 anthropic 识别）的剥离已下沉到构建函数内，对每个文本片段生效。
+                    user_message = await self._build_user_message(
+                        processed_prompt, is_anthropic, client, image_b64_cache
+                    )
                     message_list.append(user_message)
                     request_kwargs["message_list"] = message_list
 
@@ -872,6 +883,97 @@ class _RequestStrategy:
         assert model_config is not None, "model_config 不能为 None"
         fallback_model_info = model_config.get_model_info(self.model_list[0])
         return APIResponse(content="所有模型都请求失败"), fallback_model_info
+
+    async def _build_user_message(
+        self,
+        processed_prompt: str,
+        is_anthropic: bool,
+        client: BaseClient,
+        image_b64_cache: dict[str, tuple[str, str] | None],
+    ) -> Message:
+        """构建 user 消息。
+
+        不含图片占位标记时走纯文本路径（仅按需剥离缓存断点标记）；含标记时按标记把 prompt
+        拆成"文本/图片"交替片段，逐段构造图文混合内容。非 anthropic 客户端的缓存断点标记在
+        每个文本片段上分别剥离，确保与图片标记互不误伤；anthropic 的文本片段保留断点标记（由客户端处理）。
+        """
+        if not IMAGE_PLACEHOLDER_PATTERN.search(processed_prompt):
+            if not is_anthropic and CACHE_BREAKPOINT_MARKER in processed_prompt:
+                processed_prompt = processed_prompt.replace(CACHE_BREAKPOINT_MARKER, "")
+            return MessageBuilder().add_text_content(processed_prompt).build()
+
+        try:
+            support_formats = client.get_support_image_formats()
+        except Exception:
+            support_formats = None
+
+        builder = MessageBuilder()
+        # split 结果为 [文本, image_id, 文本, image_id, ..., 文本]，偶数下标是文本，奇数下标是 image_id
+        parts = IMAGE_PLACEHOLDER_PATTERN.split(processed_prompt)
+        expanded = 0
+        for idx, part in enumerate(parts):
+            if idx % 2 == 0:
+                text = part
+                if not is_anthropic and CACHE_BREAKPOINT_MARKER in text:
+                    text = text.replace(CACHE_BREAKPOINT_MARKER, "")
+                if text:
+                    builder.add_text_content(text)
+                continue
+
+            image_id = part
+            loaded = await self._load_image_base64(image_id, image_b64_cache)
+            if not loaded:
+                # 取图失败：标记退化为空串丢弃；描述文字仍在前一段文本里，语义不丢
+                continue
+            image_format, image_base64 = loaded
+            try:
+                builder.add_image_content(image_format, image_base64, support_formats=support_formats)
+                expanded += 1
+            except Exception as e:
+                # 客户端不支持该图片格式等：退化为空串剥离
+                logger.warning(f"[看图] 图片 {image_id} 格式 {image_format} 无法注入，已跳过: {e}")
+
+        if expanded:
+            logger.debug(f"[看图] 本次请求向 prompt 注入了 {expanded} 张真实图片")
+        return builder.build()
+
+    async def _load_image_base64(
+        self, image_id: str, cache: dict[str, tuple[str, str] | None]
+    ) -> tuple[str, str] | None:
+        """按 image_id 从 Images 表取路径并读盘转 base64，返回 (格式, base64)；失败返回 None。
+
+        读盘用 asyncio.to_thread 包裹避免阻塞事件循环；结果（含失败）写入 cache，同一次请求复用。
+        """
+        if image_id in cache:
+            return cache[image_id]
+
+        import os
+
+        from sqlalchemy import select as _select
+
+        from src.chat.utils.utils_image import image_path_to_base64
+        from src.common.database.compatibility import get_db_session
+        from src.common.database.core.models import Images
+
+        result: tuple[str, str] | None = None
+        try:
+            async with get_db_session() as session:
+                path = (
+                    await session.execute(_select(Images.path).where(Images.image_id == image_id))
+                ).scalar_one_or_none()
+            if not path:
+                logger.warning(f"[看图] 图片记录缺失，无法展开: {image_id}")
+            else:
+                image_format = os.path.splitext(path)[1].lstrip(".").lower() or "jpeg"
+                image_base64 = await asyncio.to_thread(image_path_to_base64, path)
+                result = (image_format, image_base64)
+        except FileNotFoundError:
+            logger.warning(f"[看图] 图片文件不存在，无法展开: {image_id}")
+        except Exception as e:
+            logger.warning(f"[看图] 读取图片失败，无法展开 {image_id}: {e}")
+
+        cache[image_id] = result
+        return result
 
     async def _try_model_request(
         self, model_info: ModelInfo, api_provider: APIProvider, client: BaseClient, request_type: RequestType, **kwargs

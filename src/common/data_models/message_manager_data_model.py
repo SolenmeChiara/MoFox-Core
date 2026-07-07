@@ -81,6 +81,10 @@ class StreamContext(BaseDataModel):
     processing_message_id: str | None = None  # 当前正在规划/处理的目标消息ID，用于防止重复回复
     decision_history: list["DecisionRecord"] = field(default_factory=list)  # 决策历史
 
+    # 按需看图：被 view_image 动作"钉住"的图片集合。image_id -> 钉住时间戳（用于 LRU 淘汰）。
+    # 被钉住的图会在后续渲染中以真实图片形式注入 replyer prompt，直到滚出窗口自动失效；每 chat 上限 3 张。
+    pinned_images: dict[str, float] = field(default_factory=dict)
+
     # 消息缓存系统相关字段
     message_cache: deque["DatabaseMessages"] = field(default_factory=deque)  # 消息缓存队列
     is_cache_enabled: bool = False  # 是否为当前用户启用缓存

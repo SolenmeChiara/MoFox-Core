@@ -13,11 +13,116 @@ from src.common.database.core.models import ActionRecords, Images
 from src.common.logger import get_logger
 from src.common.message_repository import count_messages, find_messages
 from src.config.config import global_config
+from src.llm_models.payload_content.message import format_image_placeholder
 from src.person_info.person_info import PersonInfoManager, get_person_info_manager
 
 logger = get_logger("chat_message_builder")
 
 install(extra_lines=3)
+
+# 匹配历史文本中的图片占位（processed_plain_text 里存储的是 [picid:{image_id}]）
+_PICID_PATTERN = re.compile(r"\[picid:([^\]]+)\]")
+
+
+async def render_pic_ids_in_text(
+    content: str,
+    show_pic_ids: bool = False,
+    pinned_image_ids: set[str] | None = None,
+) -> str:
+    """把文本中的 [picid:{image_id}] 占位替换为可读的图片描述。
+
+    三种模式（默认参数下与历史行为完全一致）：
+    - 默认（show_pic_ids=False, pinned_image_ids=None）：替换为 [图片：描述]。
+    - show_pic_ids=True：替换为 [图片id:{短id} 描述：描述]，供 planner 引用（短 id 省 token）。
+    - pinned_image_ids 命中：在描述之后追加展开锚点 <<<MOFOX_IMAGE:image_id>>>，
+      供下游 utils_model 展开为真实图片；描述仍保留，作取图失败时的语义回退。
+    show_pic_ids 与 pinned 可独立叠加，互不影响。
+    """
+    matches = list(_PICID_PATTERN.finditer(content))
+    if not matches:
+        return content
+
+    new_content = ""
+    last_end = 0
+    for match in matches:
+        new_content += content[last_end : match.start()]
+        pic_id = match.group(1)
+        # 沿用历史取值方式：非空描述用原始值（不 strip，保持与旧逻辑逐字节一致）
+        description_text: str | None = None
+        try:
+            async with get_db_session() as session:
+                result = await session.execute(select(Images.description).where(Images.image_id == pic_id))
+                desc_scalar = result.scalar_one_or_none()
+                if desc_scalar and desc_scalar.strip():
+                    description_text = desc_scalar
+        except Exception as e:
+            logger.debug(f"[chat_message_builder] 查询图片 {pic_id} 描述失败: {e}")
+
+        if show_pic_ids:
+            short_id = pic_id[:8]
+            replacement = (
+                f"[图片id:{short_id} 描述：{description_text}]"
+                if description_text
+                else f"[图片id:{short_id} 图片内容未知]"
+            )
+        else:
+            replacement = f"[图片：{description_text}]" if description_text else "[图片内容未知]"
+
+        if pinned_image_ids and pic_id in pinned_image_ids:
+            replacement += format_image_placeholder(pic_id)
+
+        new_content += replacement
+        last_end = match.end()
+    new_content += content[last_end:]
+    return new_content
+
+
+def extract_pic_ids_from_texts(texts) -> set[str]:
+    """从若干消息文本中收集全部 [picid:...] 的完整 image_id 集合。"""
+    pic_ids: set[str] = set()
+    for text in texts:
+        if not text:
+            continue
+        for match in _PICID_PATTERN.finditer(text):
+            pic_ids.add(match.group(1))
+    return pic_ids
+
+
+def collect_pic_ids_from_context(stream_context) -> set[str]:
+    """收集当前会话窗口（已读 history + 未读 unread）内出现过的全部图片 image_id。
+
+    供 view_image 动作做短 id 前缀解析、以及滚窗自愈（判断钉住图是否仍在窗口内）。
+    """
+    texts: list[str] = []
+    for attr in ("history_messages", "unread_messages"):
+        for msg in getattr(stream_context, attr, None) or []:
+            text = getattr(msg, "processed_plain_text", None)
+            if text:
+                texts.append(text)
+    return extract_pic_ids_from_texts(texts)
+
+
+def resolve_short_pic_id(short_or_full_id: str, known_pic_ids: set[str]) -> str | None:
+    """把 planner 给出的（可能是 8 位短 id 的）图片标识还原为完整 image_id。
+
+    规则：精确命中优先；否则按前缀匹配，仅当唯一命中时接受；未命中或歧义返回 None。
+    """
+    if not short_or_full_id:
+        return None
+    if short_or_full_id in known_pic_ids:
+        return short_or_full_id
+    candidates = [pid for pid in known_pic_ids if pid.startswith(short_or_full_id)]
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+def prune_pinned_images(pinned_images: dict[str, float], window_pic_ids: set[str]) -> list[str]:
+    """滚窗自愈：把已经滚出当前窗口的钉住图片从集合中剔除，返回被剔除的 image_id 列表。"""
+    removed = [pid for pid in pinned_images if pid not in window_pic_ids]
+    for pid in removed:
+        del pinned_images[pid]
+    return removed
 
 
 def replace_user_references_sync(
@@ -535,6 +640,8 @@ async def _build_readable_messages_internal(
     pic_counter: int = 1,
     show_pic: bool = True,
     message_id_list: list[dict[str, Any]] | None = None,
+    pinned_image_ids: set[str] | None = None,
+    show_pic_ids: bool = False,
 ) -> tuple[str, list[tuple[float, str, str]], dict[str, str], int]:
     """
     内部辅助函数，构建可读消息字符串和原始消息详情列表。
@@ -562,35 +669,14 @@ async def _build_readable_messages_internal(
         pic_id_mapping = {}
     current_pic_counter = pic_counter
 
-    # --- 异步图片ID处理器 (修复核心问题) ---
+    # --- 异步图片ID处理器 ---
     async def process_pic_ids(content: str) -> str:
-        """异步处理内容中的图片ID，将其直接替换为[图片：描述]格式"""
-        pic_pattern = r"\[picid:([^\]]+)\]"
-        matches = list(re.finditer(pic_pattern, content))
-        if not matches:
-            return content
-
-        new_content = ""
-        last_end = 0
-        for match in matches:
-            new_content += content[last_end : match.start()]
-            pic_id = match.group(1)
-            description = "[图片内容未知]"
-            try:
-                async with get_db_session() as session:
-                    result = await session.execute(select(Images.description).where(Images.image_id == pic_id))
-                    desc_scalar = result.scalar_one_or_none()
-                    if desc_scalar and desc_scalar.strip():
-                        description = f"[图片：{desc_scalar}]"
-                    else:
-                        description = "[图片内容未知]"
-            except Exception as e:
-                logger.debug(f"[chat_message_builder] 查询图片 {pic_id} 描述失败: {e}")
-                description = "[图片内容未知]"
-            new_content += description
-            last_end = match.end()
-        new_content += content[last_end:]
-        return new_content
+        """把内容中的 [picid:...] 按当前渲染模式（默认/短id/钉住展开）替换为可读描述。"""
+        return await render_pic_ids_in_text(
+            content,
+            show_pic_ids=show_pic_ids,
+            pinned_image_ids=pinned_image_ids,
+        )
 
     # 创建时间戳到消息ID的映射，用于在消息前添加[id]标识符
     timestamp_to_id = {}
@@ -989,6 +1075,8 @@ async def build_readable_messages_with_id(
     truncate: bool = False,
     show_actions: bool = False,
     show_pic: bool = True,
+    pinned_image_ids: set[str] | None = None,
+    show_pic_ids: bool = False,
 ) -> tuple[str, list[dict[str, Any]]]:
     """
     将消息列表转换为可读的文本格式，并返回原始(时间戳, 昵称, 内容)列表。
@@ -1006,6 +1094,8 @@ async def build_readable_messages_with_id(
         show_pic=show_pic,
         read_mark=read_mark,
         message_id_list=message_id_list,
+        pinned_image_ids=pinned_image_ids,
+        show_pic_ids=show_pic_ids,
     )
 
     return formatted_string, message_id_list
@@ -1021,6 +1111,8 @@ async def build_readable_messages(
     show_actions: bool = True,
     show_pic: bool = True,
     message_id_list: list[dict[str, Any]] | None = None,
+    pinned_image_ids: set[str] | None = None,
+    show_pic_ids: bool = False,
 ) -> str:  # sourcery skip: extract-method
     """
     将消息列表转换为可读的文本格式。
@@ -1119,6 +1211,8 @@ async def build_readable_messages(
             truncate,
             show_pic=show_pic,
             message_id_list=message_id_list,
+            pinned_image_ids=pinned_image_ids,
+            show_pic_ids=show_pic_ids,
         )
 
         return formatted_string
@@ -1142,6 +1236,8 @@ async def build_readable_messages(
             pic_counter,
             show_pic=show_pic,
             message_id_list=message_id_list,
+            pinned_image_ids=pinned_image_ids,
+            show_pic_ids=show_pic_ids,
         )
         formatted_after, _, pic_id_mapping, _ = await _build_readable_messages_internal(
             messages_after_mark,
@@ -1153,6 +1249,8 @@ async def build_readable_messages(
             pic_counter,
             show_pic=show_pic,
             message_id_list=message_id_list,
+            pinned_image_ids=pinned_image_ids,
+            show_pic_ids=show_pic_ids,
         )
 
         read_mark_line = "\n--- 以上消息是你已经看过，请关注以下未读的新消息---\n"
