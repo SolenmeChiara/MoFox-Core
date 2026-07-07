@@ -35,7 +35,13 @@ from src.common.logger import get_logger
 from src.config.api_ada_configs import APIProvider, ModelInfo, TaskConfig
 from src.config.config import model_config
 
-from .exceptions import NetworkConnectionError, ReqAbortException, RespNotOkException, RespParseException
+from .exceptions import (
+    ModelRefusalException,
+    NetworkConnectionError,
+    ReqAbortException,
+    RespNotOkException,
+    RespParseException,
+)
 from .model_client.base_client import APIResponse, BaseClient, UsageRecord, client_registry
 from .payload_content.message import (
     CACHE_BREAKPOINT_MARKER,
@@ -242,6 +248,13 @@ class _ModelSelector:
         """
         stats = self.model_usage[model_name]
         penalty_increment = self.DEFAULT_PENALTY_INCREMENT
+
+        # 模型拒答：确定性不可重试。仅施加基础惩罚（多模型集下有助于把拒答模型排到候选后面）；
+        # 醒目日志在客户端层 _parse_response、跳过重试的决策日志在 _handle_exception 记录，此处不重复告警。
+        if isinstance(e, ModelRefusalException):
+            self.model_usage[model_name] = stats._replace(penalty=stats.penalty + penalty_increment)
+            logger.debug(f"模型 '{model_name}' 被安全分类器拒答(category={e.category})，施加基础惩罚 {penalty_increment}")
+            return
 
         # 对严重错误施加更高的惩罚，以便快速将问题模型移出候选池
         if isinstance(e, NetworkConnectionError | ReqAbortException):
@@ -679,6 +692,15 @@ class _RequestExecutor:
         model_name = model_info.name
         retry_interval = api_provider.retry_interval
 
+        # 模型拒答：确定性复现，重试无意义 → 直接放弃对该模型的内部重试（返回 -1），
+        # 由上层 execute_with_failover 计入失败列表并（多模型时）故障转移。
+        if isinstance(e, ModelRefusalException):
+            logger.warning(
+                f"任务-'{self.task_name}' 模型-'{model_name}': {e}，"
+                f"拒答确定性复现，跳过内部重试，直接故障转移/上报。"
+            )
+            return -1, None
+
         if isinstance(e, NetworkConnectionError | ReqAbortException):
             return await self._check_retry(remain_try, retry_interval, "连接异常", model_name)
         elif isinstance(e, RespNotOkException):
@@ -875,6 +897,10 @@ class _RequestStrategy:
 
         logger.error(f"当前请求已尝试 {max_attempts} 个模型，所有模型均已失败。")
         if raise_when_empty:
+            # 末次失败为模型拒答时，把拒答标记与 category 带进上层错误信息，供 maizone 等调用方据此
+            # 识别并将对应消息标记为「处理失败」；其余失败路径的错误措辞保持一字不变。
+            if isinstance(last_exception, ModelRefusalException):
+                raise RuntimeError(f"所有模型均未能生成响应：{last_exception}") from last_exception
             if last_exception:
                 raise RuntimeError("所有模型均未能生成响应。") from last_exception
             raise RuntimeError("所有模型均未能生成响应，且无具体异常信息。")

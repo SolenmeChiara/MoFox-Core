@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from .person_memory_service import PersonMemoryService
 
 from src.common.logger import get_logger
+from src.llm_models.exceptions import ModelRefusalException
 from src.llm_models.payload_content.message import CACHE_BREAKPOINT_MARKER
 from src.llm_models.utils_model import LLMRequest
 from src.plugin_system.apis import config_api, llm_api, person_api
@@ -711,6 +712,25 @@ class ContentService:
             logger.warning(f"执行动态选择时发生异常: {e}")
             return None
 
+    @staticmethod
+    def _parse_comment_refusal(error_text: str) -> str | None:
+        """从 generate_with_model 返回的失败信息串里识别「模型拒答」并提取 category。
+
+        拒答（stop_reason=refusal）经 utils_model 会把 ``【模型拒答】...category=xxx`` 带进错误信息，
+        这里据此区分「拒答失败」与其它生成失败（空回复/网络等）。
+
+        :return: 拒答且可提取 category → category 字符串；拒答但无 category → "unknown"；非拒答 → None。
+        """
+        if not error_text or ModelRefusalException.REFUSAL_TAG not in error_text:
+            return None
+        import re
+
+        m = re.search(r"category=([^)\s,，]+)", error_text)
+        category = m.group(1) if m else "unknown"
+        if category in ("None", "none", ""):
+            category = "unknown"
+        return category
+
     async def generate_qzone_comment(
         self,
         target_name: str,
@@ -718,7 +738,7 @@ class ContentService:
         rt_con: str | None = None,
         images: list[str] | None = None,
         target_qq: str | None = None,
-    ) -> str:
+    ) -> tuple[str, str | None]:
         """
         针对他人的说说内容生成评论。使用空间专用提示词。
 
@@ -727,7 +747,8 @@ class ContentService:
         :param rt_con: 转发内容（可选）
         :param images: 图片URL列表（可选）
         :param target_qq: 说说作者QQ号（可选）
-        :return: 生成的评论内容
+        :return: ``(评论内容, 拒答category)``。成功时 ``(评论, None)``；
+                 因模型拒答失败时 ``("", category)``；其它失败时 ``("", None)``。
         """
         try:
             # 清理可能的截断标记
@@ -741,7 +762,7 @@ class ContentService:
 
             if not model_config:
                 logger.error("未配置LLM模型")
-                return ""
+                return "", None
 
             # 获取机器人人格（三要素：核心人格、人格侧面、表达方式）
             bot_personality_core = config_api.get_global_config("personality.personality_core", "一个友好的机器人")
@@ -864,14 +885,23 @@ class ContentService:
                 if comment.startswith("'") and comment.endswith("'"):
                     comment = comment[1:-1]
                 logger.info(f"成功生成空间评论（长度{len(comment)}）：'{comment}'")
-                return comment
+                return comment, None
             else:
+                # success=False 时 comment 承载的是 generate_with_model 的错误信息串；
+                # 若其中带「模型拒答」标记，则把拒答 category 单独回传，供上层标记「消息处理失败」。
+                refused_category = self._parse_comment_refusal(comment)
+                if refused_category is not None:
+                    logger.warning(
+                        f"{ModelRefusalException.REFUSAL_TAG}生成空间评论被拒答(category={refused_category})，"
+                        f"目标: {target_name}"
+                    )
+                    return "", refused_category
                 logger.error("生成空间评论失败")
-                return ""
+                return "", None
 
         except Exception as e:
             logger.error(f"生成空间评论时发生异常: {e}")
-            return ""
+            return "", None
 
     async def generate_comment_reply(
         self,

@@ -800,8 +800,8 @@ class QZoneService:
             logger.debug(f"锁定待评论说说: {comment_key}")
             self.processing_comments.add(comment_key)
             try:
-                # 使用空间专用评论方法
-                comment_text = await self.content_service.generate_qzone_comment(
+                # 使用空间专用评论方法（返回 (评论文本, 拒答category)）
+                comment_text, refused_category = await self.content_service.generate_qzone_comment(
                     target_name=target_name,
                     content=content or rt_con or "说说内容",
                     rt_con=rt_con if content else None,
@@ -839,6 +839,17 @@ class QZoneService:
                                 logger.warning(f"[接话] 追踪已评论说说失败(fid={fid}): {e}")
                     else:
                         logger.error(f"评论'{target_name}'的说说失败")
+                elif refused_category is not None:
+                    # 评论生成被模型拒答：拒答对同一说说是确定性的，标记为已处理（复用 main_comment 标记），
+                    # 避免之后轮次反复选中这条说说重撞拒答；按「消息处理失败」语义记录，带上说说摘要 + 拒绝
+                    # category，便于翻日志定位「哪条说说、什么内容、被什么理由拒了」。
+                    self.reply_tracker.mark_as_replied(fid, "main_comment")
+                    feed_summary = (content or rt_con or "").strip().replace("\n", " ")[:80]
+                    logger.warning(
+                        f"【消息处理失败】说说(fid={fid}) 评论生成被模型拒答(category={refused_category})，"
+                        f"已标记为已处理以避免后续轮次重复重试。说说摘要：{feed_summary}"
+                    )
+                # 其余情况（comment_text 为空且非拒答，如空回复/网络失败）：保持现状不标记，允许自然重试
             except Exception as e:
                 logger.error(f"评论'{target_name}'的说说时发生异常: {e}")
             finally:

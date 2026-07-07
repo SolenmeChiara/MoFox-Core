@@ -25,6 +25,7 @@ from src.common.logger import get_logger
 from src.config.api_ada_configs import APIProvider, ModelInfo
 
 from ..exceptions import (
+    ModelRefusalException,
     NetworkConnectionError,
     ReqAbortException,
     RespNotOkException,
@@ -287,14 +288,11 @@ def _parse_response(payload: dict[str, Any], model_info: ModelInfo) -> APIRespon
     api_resp = APIResponse()
     api_resp.raw_data = payload
 
-    # Fable 5 等模型的安全分类器可能拒绝请求：HTTP 200 + stop_reason="refusal"，content 为空。
-    # 这里输出告警便于排查；上层的空回复处理会自动故障转移到列表中的下一个模型。
-    if payload.get("stop_reason") == "refusal":
-        stop_details = payload.get("stop_details") or {}
-        logger.warning(
-            f"[{model_info.name}] 请求被模型安全分类器拒绝 (stop_reason=refusal, "
-            f"category={stop_details.get('category')}), 将由空回复处理逻辑故障转移"
-        )
+    # Fable 5 等模型的安全分类器可能拒答：HTTP 200 + stop_reason="refusal"，content 为空，
+    # stop_details 里带 category 等信息。拒答对相同输入是确定性的，重试纯属浪费，因此此处不再把它
+    # 降级成空回复，而是（在照常记完 usage/缓存统计后）抛出不可重试的 ModelRefusalException，
+    # 交由 utils_model 跳过内部重试并把拒答标记带向上层。醒目告警见下方 usage 处理之后。
+    is_refusal = payload.get("stop_reason") == "refusal"
 
     text_parts: list[str] = []
     thinking_parts: list[str] = []
@@ -339,6 +337,17 @@ def _parse_response(payload: dict[str, Any], model_info: ModelInfo) -> APIRespon
             cache_creation_tokens=cache_create,
         )
         _log_cache_stats(model_info.name, cache_read, cache_create, input_tokens, output_tokens)
+
+    # usage/缓存统计已照常记录；拒答在此醒目告警并抛出「不可重试」异常，让 utils_model 快速失败。
+    if is_refusal:
+        stop_details = payload.get("stop_details") or {}
+        category = stop_details.get("category")
+        logger.warning(
+            f"{ModelRefusalException.REFUSAL_TAG}[{model_info.name}] 请求被模型安全分类器拒答："
+            f"stop_reason=refusal, category={category}, stop_details={stop_details}。"
+            f"拒答对相同输入具有确定性，将跳过对该模型的内部重试。"
+        )
+        raise ModelRefusalException(model_info.name, category, stop_details)
 
     return api_resp
 
