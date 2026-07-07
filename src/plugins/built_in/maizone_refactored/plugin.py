@@ -24,6 +24,7 @@ from .services.monitor_service import MonitorService
 from .services.person_memory_service import PersonMemoryService
 from .services.qzone_service import QZoneService
 from .services.reply_tracker_service import ReplyTrackerService
+from .services.repost_tracking_service import RepostTrackingService
 from .services.scheduler_service import SchedulerService
 from .services.social_loop_service import SocialLoopService
 
@@ -156,6 +157,34 @@ class MaiZoneRefactoredPlugin(BasePlugin):
                 type=int, default=2, description="同一条说说里 bot 最多接话的次数（防无限对聊刷楼）"
             ),
         },
+        "repost": {
+            "enable_repost": ConfigField(
+                type=bool,
+                default=False,
+                description="是否启用「转发锐评」：偶尔把好友的转发类说说转到自己空间并配一句短评。"
+                "极度保守：默认关闭；仅转发本身就是转发的说说（social norm），需观察后再手动开启",
+            ),
+            "max_reposts_per_day": ConfigField(
+                type=int, default=1, description="每天最多转发次数（保守建议 1）"
+            ),
+            "repost_cooldown_hours": ConfigField(
+                type=int,
+                default=24,
+                description="两次转发尝试之间的冷却小时数：本冷却也限制「拉候选+LLM判定」这条昂贵路径的频率（保守建议 ≥24）",
+            ),
+            "per_friend_cooldown_days": ConfigField(
+                type=int, default=7, description="转发过某好友的说说后，多少天内不再转发该好友（保守建议 7）"
+            ),
+            "candidate_scan_count": ConfigField(
+                type=int, default=20, description="每次通过频率闸后，扫描好友动态时间线的条数（复用监控拉取，非新增常态请求）"
+            ),
+            "repost_delay_min_seconds": ConfigField(
+                type=int, default=5, description="执行转发前随机延迟下限（秒），模拟真人节奏"
+            ),
+            "repost_delay_max_seconds": ConfigField(
+                type=int, default=15, description="执行转发前随机延迟上限（秒），模拟真人节奏"
+            ),
+        },
     }
 
     permission_nodes: list[PermissionNodeField] = [
@@ -177,6 +206,8 @@ class MaiZoneRefactoredPlugin(BasePlugin):
         reply_tracker_service = ReplyTrackerService()
         # 好友说说接话闭环：追踪 bot 评论过的好友说说，供 QZoneService.check_comment_replies 轮询
         comment_tracking_service = CommentTrackingService()
+        # 转发锐评风控追踪：永久转发记录 + 每日计数 + 好友级 / 尝试冷却
+        repost_tracking_service = RepostTrackingService()
 
         qzone_service = QZoneService(
             self.get_config,
@@ -188,9 +219,12 @@ class MaiZoneRefactoredPlugin(BasePlugin):
             comment_tracking=comment_tracking_service,
         )
         scheduler_service = SchedulerService(self.get_config, qzone_service)
-        # 社交闭环服务：计数门 + 访客回访 + 回赞，注入监控服务由其定时循环驱动
+        # 社交闭环服务：计数门 + 访客回访 + 回赞 + 转发锐评，注入监控服务由其定时循环驱动
         social_loop_service = SocialLoopService(
-            self.get_config, qzone_service, person_memory=person_memory_service
+            self.get_config,
+            qzone_service,
+            person_memory=person_memory_service,
+            repost_tracking=repost_tracking_service,
         )
         monitor_service = MonitorService(
             self.get_config, qzone_service, social_loop_service=social_loop_service

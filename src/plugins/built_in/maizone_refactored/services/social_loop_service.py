@@ -27,6 +27,7 @@ from src.plugin_system.apis.storage_api import get_local_storage
 if TYPE_CHECKING:
     from .person_memory_service import PersonMemoryService
     from .qzone_service import QZoneService
+    from .repost_tracking_service import RepostTrackingService
 
 logger = get_logger("MaiZone.SocialLoop")
 
@@ -44,10 +45,13 @@ class SocialLoopService:
         get_config: Callable,
         qzone_service: "QZoneService",
         person_memory: "PersonMemoryService | None" = None,
+        repost_tracking: "RepostTrackingService | None" = None,
     ):
         self.get_config = get_config
         self.qzone_service = qzone_service
         self.person_memory = person_memory
+        # 转发锐评风控追踪（可选）：永久转发记录 + 每日计数 + 好友级 / 尝试冷却
+        self.repost_tracking = repost_tracking
         # 三个独立的本地存储：访客冷却、回赞冷却、上次未读计数
         self.visitor_store = get_local_storage(_VISITOR_STORAGE)
         self.likeback_store = get_local_storage(_LIKEBACK_STORAGE)
@@ -139,6 +143,14 @@ class SocialLoopService:
                 await self.qzone_service.check_comment_replies()
             except Exception as e:
                 logger.error(f"[计数门] 好友说说接话轮次失败: {e}")
+
+            # --- 转发锐评 ---
+            # 同样放在末尾无条件调用（自带 enable 开关 + 每日次数 / 尝试冷却闸 + 失败隔离）：
+            # 默认关闭，关闭时立即返回、零行为零写盘；开启后每冷却周期至多走一次昂贵路径。
+            try:
+                await self.repost_round()
+            except Exception as e:
+                logger.error(f"[转发] 转发锐评轮次失败: {e}")
 
             # 仅当计数可用时，落盘本轮计数作为下次比较基准
             if isinstance(current, dict):
@@ -288,3 +300,129 @@ class SocialLoopService:
                     logger.error(f"[回赞] 回赞 {name}({qq}) 异常: {e}")
         except Exception as e:
             logger.error(f"[回赞] 回赞轮次异常（不影响监控主流程）: {e}")
+
+    # ---------------- 4. 转发锐评闭环 ----------------
+
+    @staticmethod
+    def _extract_rt_con(feed: dict) -> str:
+        """从候选 feed 里提取「被转发内容」文本（兼容 rt_con 为字符串或 {'content': ...} 字典）。"""
+        raw = feed.get("rt_con")
+        if isinstance(raw, dict):
+            raw = raw.get("content", "")
+        return raw.strip() if isinstance(raw, str) else ""
+
+    async def repost_round(self) -> None:
+        """一轮「转发锐评」：极度保守地把一条好友的**转发类**说说转到自己空间并配短评。
+
+        全链路风控闸门（顺序即调用顺序，闸门在动作之前）：
+          0. ``enable_repost`` 开关（默认关闭）→ 关闭立即返回，零行为零写盘。
+          1. 每日次数闸：今日已达 ``max_reposts_per_day`` → 跳过。
+          2. 尝试冷却闸：距上次「尝试」不足 ``repost_cooldown_hours`` → 跳过
+             （此闸把「拉候选 + LLM 判定」这条昂贵路径限制到每冷却周期至多一次）。
+          3. 落「尝试戳」（**动作前写入**）→ 即便下面无候选 / LLM 判 SKIP，本周期也不再重复。
+          4. 复用 ``monitor_list_feeds`` 拉候选，硬过滤：**必须本身是转发（rt_con 非空）** +
+             未转过（永久表）+ 该好友未在冷却 + 非自己。
+          5. LLM「宁缺毋滥」判定（默认 SKIP）→ SKIP / 生成失败则不转发。
+          6. 落所有风控戳（永久标记 + 每日计数 + 好友冷却，**动作前写入**）。
+          7. 随机延迟后调用 ``repost_feed`` 执行转发；成功则记人。
+
+        整体失败隔离：任何异常只告警，绝不影响监控 / 其他社交闭环。
+        """
+        try:
+            if not self.get_config("repost.enable_repost", False):
+                return
+            if self.repost_tracking is None:
+                logger.warning("[转发] 已开启但未注入转发追踪服务，跳过（请检查插件装配）")
+                return
+
+            tracker = self.repost_tracking
+            max_per_day = int(self.get_config("repost.max_reposts_per_day", 1))
+            cooldown_h = float(self.get_config("repost.repost_cooldown_hours", 24))
+            per_friend_days = float(self.get_config("repost.per_friend_cooldown_days", 7))
+            scan_count = int(self.get_config("repost.candidate_scan_count", 20))
+            delay_min = int(self.get_config("repost.repost_delay_min_seconds", 5))
+            delay_max = int(self.get_config("repost.repost_delay_max_seconds", 15))
+
+            # 闸 1：每日次数
+            done_today = tracker.reposts_today()
+            if done_today >= max_per_day:
+                logger.info(f"[转发] 今日已转发 {done_today}/{max_per_day} 次，达上限，跳过")
+                return
+
+            # 闸 2：尝试冷却（限制昂贵路径频率）
+            if tracker.attempt_on_cooldown(cooldown_h * 3600):
+                logger.info(f"[转发] 距上次转发尝试不足 {cooldown_h:.0f}h（冷却中），跳过")
+                return
+
+            # 闸 3：先落尝试戳（动作前写入）——本周期内即便无候选 / SKIP 也不再重复拉取 / 调 LLM
+            tracker.mark_attempt()
+            logger.info("[转发] 通过频率闸，开始拉取好友动态候选并筛选转发候选")
+
+            # 闸 4：复用现有时间线拉取，硬过滤候选
+            candidates = await self.qzone_service.get_friend_feed_candidates(scan_count)
+            if not candidates:
+                logger.info("[转发] 本轮未拉到好友动态候选，跳过")
+                return
+
+            self_qq = self._self_qq()
+            per_friend_s = per_friend_days * 86400
+            filtered: list[dict] = []
+            for feed in candidates:
+                tid = str(feed.get("tid", "") or "")
+                qq = str(feed.get("target_qq", "") or "")
+                if not tid or not qq or qq == self_qq:
+                    continue
+                # 硬过滤（代码级）：只有本身是转发的说说（rt_con 非空）才进候选池
+                rt_con = self._extract_rt_con(feed)
+                if not rt_con:
+                    continue
+                # 永不二转
+                if tracker.already_reposted(tid):
+                    continue
+                # 好友级冷却
+                if tracker.friend_on_cooldown(qq, per_friend_s):
+                    continue
+                filtered.append(feed)
+
+            logger.info(f"[转发] 候选 {len(candidates)} 条，硬过滤后合规转发候选 {len(filtered)} 条")
+            if not filtered:
+                logger.info("[转发] 本轮无合规转发候选（需本身是转发、未转过、好友未冷却），跳过")
+                return
+
+            # 从合规候选中随机取一条（增加多样性；至多转 1 条）
+            target = random.choice(filtered)
+            tid = str(target.get("tid", ""))
+            qq = str(target.get("target_qq", ""))
+            rt_con = self._extract_rt_con(target)
+            own_words = target.get("content", "") or ""
+
+            # 闸 5：LLM「宁缺毋滥」判定（默认 SKIP）
+            comment = await self.qzone_service.content_service.generate_repost_comment(
+                target_name=qq, content=own_words, rt_con=rt_con, target_qq=qq
+            )
+            if not comment:
+                logger.info(f"[转发] LLM 判定不转发（SKIP）或生成失败，源tid={tid}，本轮跳过")
+                return
+
+            # 闸 6：落所有风控戳（动作前写入：永久标记 + 每日计数 + 好友冷却）
+            tracker.record_repost(tid, qq)
+
+            # 闸 7：随机延迟后执行转发，模拟真人节奏
+            if delay_max > 0:
+                lo, hi = min(delay_min, delay_max), max(delay_min, delay_max)
+                await asyncio.sleep(random.uniform(lo, hi))
+
+            logger.info(f"[转发] 准备转发好友({qq})的转发说说 源tid={tid} 配文='{comment}'")
+            result = await self.qzone_service.repost_feed(qq, tid, rt_con, comment)
+            if result.get("success"):
+                logger.info(f"[转发] 已转发好友({qq})的转发说说 源tid={tid} 新tid={result.get('tid', '')}")
+                # 记人：注册互动对象（转发是较重的互动，但候选无昵称，仅注册不写细节）
+                if self.person_memory is not None:
+                    try:
+                        await self.person_memory.register_person(qq, qq)
+                    except Exception as e:
+                        logger.warning(f"[转发] 注册转发对象到记人系统失败(qq={qq}): {e}")
+            else:
+                logger.warning(f"[转发] 转发未成功（风控戳已落，本条不会重试）: {result.get('message', '')}")
+        except Exception as e:
+            logger.error(f"[转发] 转发锐评轮次异常（不影响监控主流程）: {e}")

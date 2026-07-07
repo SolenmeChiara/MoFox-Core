@@ -1250,6 +1250,164 @@ class ContentService:
             logger.error(f"生成空间接话时发生异常: {e}")
             return None
 
+    async def generate_repost_comment(
+        self,
+        target_name: str,
+        content: str,
+        rt_con: str | None = None,
+        target_qq: str | None = None,
+    ) -> str | None:
+        """「转发锐评」：判定是否把好友的（转发类）说说转到自己空间，并生成一句短评配文。
+
+        语义「宁缺毋滥」：默认**不转发**（输出 SKIP），仅当内容确实非常合自己口味 / 有趣到
+        想让自己空间的人也看到时，才生成一句简短、自然、是自己真实反应的配文。
+
+        遵守仓库缓存约定：平台说明 + 人设（静态大块）位于 ``CACHE_BREAKPOINT_MARKER`` 之前，
+        关系记忆 + 候选说说内容 + 被转发内容摘要（动态区）在标记之后。
+
+        :param target_name: 好友（原说说作者）名称（无昵称时可传 QQ 号字符串，由关系块回查真实昵称）
+        :param content: 好友这条说说的主体文字（可能只是转发时的一句话，甚至为空）
+        :param rt_con: 被转发的原始内容摘要（本功能的硬前提，调用方已保证非空）
+        :param target_qq: 好友 QQ 号（可选，用于调取与 ta 的关系 / 空间往事记忆）
+        :return: 转发配文（短评）；若判定不转发（SKIP）或生成失败，返回 ``None``。
+        """
+        try:
+            content = self._clean_truncated_content(content or "")
+            rt_summary = self._clean_truncated_content(rt_con or "")
+            if len(rt_summary) > 300:
+                rt_summary = rt_summary[:300] + "…"
+
+            # 获取模型配置
+            models = llm_api.get_available_models()
+            text_model = str(self.get_config("models.text_model", "replyer"))
+            model_config = models.get(text_model)
+            if not model_config:
+                logger.error("未配置LLM模型")
+                return None
+
+            # 机器人人格三要素
+            bot_personality_core = config_api.get_global_config("personality.personality_core", "一个友好的机器人")
+            bot_personality_side = config_api.get_global_config("personality.personality_side", "")
+            bot_reply_style = config_api.get_global_config("personality.reply_style", "内容积极向上")
+            safety_guidelines = config_api.get_global_config("personality.safety_guidelines", [])
+
+            now = datetime.datetime.now()
+            current_time = now.strftime("%m月%d日 %H:%M")
+
+            # 关系信息 + 空间互动记忆（动态区）
+            relation_info = await self._get_relation_info(target_name, target_qq)
+
+            # 人设块（静态，缓存前缀）
+            personality_block = f"你的核心人格：{bot_personality_core}"
+            if bot_personality_side:
+                personality_block += f"\n你的人格侧面：{bot_personality_side}"
+            personality_block += f"\n你的表达方式：{bot_reply_style}"
+
+            # 互动规则块（静态）
+            safety_block = ""
+            if safety_guidelines:
+                safety_block = "\n\n# 互动规则\n\n" + "\n".join(f"- {rule}" for rule in safety_guidelines[:5])
+
+            # 好友这条说说本身的文字（可能为空——转发往往只有被转发内容）
+            own_words_block = content if content else "（好友转发时没有配文字）"
+
+            prompt = f"""# 平台说明
+
+**QQ空间**是中国最流行的社交平台之一，类似于Facebook的"动态"或Instagram。用户发表"说说"，好友可以点赞、评论、转发。**转发**是把别人的内容分享到自己的空间，并配上一句自己的话。
+
+# 人设定义
+
+{personality_block}
+
+# 这条社交礼仪（务必理解）
+
+你现在在考虑要不要**转发**一条好友的说说到你自己的空间。你只会看到「好友转发别人内容」这一类候选——也就是说，被转发的东西**本身已经在传播了**，你转它是安全、礼貌的行为。你**不会**、也**不应该**转发好友的原创说说（那容易越界、让好友不舒服）。
+配文写的是你对**被转发内容本身**的真实反应，绝不是对好友本人的评价，更**不要对好友阴阳怪气**。
+{CACHE_BREAKPOINT_MARKER}
+# 用户关系
+
+{relation_info}{safety_block}
+
+# 当前场景
+
+- 时间: {current_time}
+- 场景: 你在刷QQ空间，看到好友 {target_name} 转发了一条内容，你在犹豫要不要也转到自己空间
+
+# 好友这条说说
+
+- 好友自己配的文字: {own_words_block}
+- 被转发的原始内容: {rt_summary or "（无法提取到被转发的具体内容）"}
+
+# 你要做的判断
+
+**默认不转发。** 转发意味着你把这条内容推到了你自己空间所有人的面前，所以门槛要高：
+只有当被转发的内容**确实非常合你的口味 / 有趣 / 有共鸣，让你真的想让自己空间的人也看到**时，才转发。
+只要有一点点"其实无所谓、转不转都行"，就**不要转**。
+
+# 输出要求（最高优先级）
+
+- **不想转（默认）**: 只输出 `SKIP` 这一个词。**绝对不要**解释为什么不转、不要写「我觉得…」「这条…所以不转」之类的任何理由文字——不转就只有 `SKIP`，多一个字都不行。
+- **想转**: 只输出一句转发配文本身。要求：
+  - 简短（15字左右，最多不超过30字）、口语、自然，是你看到内容时真实的第一反应；
+  - 不是营销号 / 锐评号那种夸张腔调，不硬凑金句；
+  - 符合你的人格与表达风格；
+  - 不带 Emoji、不带 @、不带引号、不带任何前后缀说明、不带思考过程、单行输出。"""
+
+            # 输出提示词到日志（青色）
+            logger.info(f"{PROMPT_HEADER_COLOR}{'='*50}{RESET_COLOR}")
+            logger.info(f"{PROMPT_HEADER_COLOR}  QQ空间转发锐评提示词 - 目标: {target_name}{RESET_COLOR}")
+            logger.info(f"{PROMPT_HEADER_COLOR}{'='*50}{RESET_COLOR}")
+            logger.info(f"{PROMPT_COLOR}{prompt}{RESET_COLOR}")
+            logger.info(f"{PROMPT_HEADER_COLOR}{'='*50} 提示词结束 {'='*50}{RESET_COLOR}")
+
+            success, comment, _, _ = await llm_api.generate_with_model(
+                prompt=prompt,
+                model_config=model_config,
+                request_type="maizone.qzone_repost",
+                temperature=0.5,
+                max_tokens=2000,
+            )
+
+            if not success:
+                logger.error("[转发] 生成转发配文失败")
+                return None
+
+            comment = (comment or "").strip()
+            if not comment:
+                logger.info("[转发] 模型未输出内容，视为不转发")
+                return None
+
+            # 去掉可能的引号包裹
+            if len(comment) >= 2 and comment[0] == comment[-1] and comment[0] in ('"', "'"):
+                comment = comment[1:-1].strip()
+
+            # 容错识别 SKIP 标记（模型可能输出 SKIP / [SKIP] / "SKIP。" 等变体）
+            import re
+
+            skip_probe = re.sub(r"[\s\[\]（）()。.!！,，'\"`]+", "", comment).upper()
+            # 宁缺毋滥：SKIP 变体一律视为不转发。用 startswith 而非 == 以兼容
+            # 「SKIP。理由…」「[SKIP] 这条不够有趣」这类模型自作主张附上理由的输出，
+            # 避免把「SKIP+解释」当配文发出去（中文人设配文几乎不可能以 ASCII "SKIP" 起头）。
+            if not comment or skip_probe.startswith("SKIP"):
+                logger.info(f"[转发] 模型判定不转发（SKIP）——{target_name} 的转发未达转发门槛")
+                return None
+
+            # 防御：提示词硬性要求配文「最多不超过30字」；超出即属违反输出契约，
+            # 多为解释性 / 拒绝性文字（如「我觉得这条不适合转发，因为…」「作为AI我认为需谨慎…」），
+            # 绝不能当配文发到自己空间墙上——一律按不转发处理（安全方向：宁可漏转，不可乱发）。
+            if len(comment) > 30:
+                logger.warning(
+                    f"[转发] 模型输出超长（{len(comment)}字 > 30字上限，疑为解释/拒绝文本），按不转发处理：'{comment[:50]}…'"
+                )
+                return None
+
+            logger.info(f"[转发] 生成转发配文（长度{len(comment)}）：'{comment}'")
+            return comment
+
+        except Exception as e:
+            logger.error(f"[转发] 生成转发配文时发生异常: {e}")
+            return None
+
     async def _describe_image(self, image_url: str) -> str | None:
         """
         使用LLM识别图片内容。

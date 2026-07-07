@@ -169,6 +169,9 @@ class QZoneService:
     # --- API Endpoints ---
     ZONE_LIST_URL = "https://user.qzone.qq.com/proxy/domain/ic2.qzone.qq.com/cgi-bin/feeds/feeds3_html_more"
     EMOTION_PUBLISH_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_publish_v6"
+    # 转发说说（转发锐评功能）：QQ空间转发走 publish 同族 CGI，在 publish 参数上追加 rt_tid/rt_uin
+    # 转发标识。⚠️ 未经 live 验证（本机不允许发起真实 QZone 请求），首次开启需真机校验，见 repost_feed。
+    EMOTION_FORWARD_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_publish_v6"
     DOLIKE_URL = "https://user.qzone.qq.com/proxy/domain/w.qzone.qq.com/cgi-bin/likes/internal_dolike_app"
     COMMENT_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_re_feeds"
     LIST_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qq.com/cgi-bin/emotion_cgi_msglist_v6"
@@ -1180,6 +1183,53 @@ class QZoneService:
             logger.error(f"给用户 {target_qq} 最新说说点赞异常: {e}")
             return {"success": False, "tid": "", "message": f"异常: {e}"}
 
+    async def get_friend_feed_candidates(self, num: int = 20) -> list[dict]:
+        """拉取好友动态时间线的原始候选列表（复用 ``monitor_list_feeds``），供转发锐评环节做候选过滤。
+
+        **不是**新增的常态拉取途径：仅当转发环节通过「每日次数 + 尝试冷却」闸后，每冷却周期至多
+        调用一次，因此不给监控主循环增加常态请求。任何失败返回 ``[]``，绝不影响主流程。
+
+        返回元素结构同 ``monitor_list_feeds``：``{"target_qq","tid","content","rt_con","images","comments"}``。
+        """
+        try:
+            qq_account = config_api.get_global_config("bot.qq_account", "")
+            api_client = await self._get_api_client(qq_account, None)
+            if not api_client:
+                return []
+            return await api_client["monitor_list_feeds"](num)
+        except Exception as e:
+            logger.error(f"[转发] 获取好友动态候选失败: {e}")
+            return []
+
+    async def repost_feed(
+        self, target_qq: str | int, feed_id: str, original_content: str, comment: str
+    ) -> dict:
+        """把好友的（转发类）说说转发到自己空间并配一句短评。
+
+        ⚠️ 转发接口未经 live 验证（详见 ``_repost``）。任何业务/网络失败均只返回失败字典、不抛出。
+
+        :return: ``{"success": bool, "tid": str, "message": str}``。
+        """
+        try:
+            qq_account = config_api.get_global_config("bot.qq_account", "")
+            api_client = await self._get_api_client(qq_account, None)
+            if not api_client:
+                return {"success": False, "tid": "", "message": "获取API客户端失败"}
+            ok, new_tid = await api_client["repost"](
+                str(target_qq), str(feed_id), original_content or "", comment
+            )
+            return {
+                "success": bool(ok),
+                "tid": new_tid,
+                "message": "转发成功" if ok else "转发失败（接口未经live验证，请核对返回）",
+            }
+        except RuntimeError as e:
+            # QQ空间业务错误（含 Cookie 失效），交由上层记录，不抛出
+            return {"success": False, "tid": "", "message": str(e)}
+        except Exception as e:
+            logger.error(f"[转发] 转发说说异常: {e}")
+            return {"success": False, "tid": "", "message": f"异常: {e}"}
+
     def _generate_gtk(self, skey: str) -> str:
         hash_val = 5381
         for char in skey:
@@ -2086,7 +2136,80 @@ class QZoneService:
                 logger.debug(f"获取点赞者名单失败: {e}")
                 return []
 
-        logger.debug("API客户端构造完成，返回包含10个方法的字典")
+        async def _repost(target_qq: str, feed_id: str, original_content: str, comment: str) -> tuple[bool, str]:
+            """转发好友的（转发类）说说到自己空间并配一句短评（转发锐评功能）。
+
+            ⚠️ 接口未经 live 验证：QQ空间转发走 ``emotion_cgi_publish_v6`` 同族 CGI，本实现以
+            ``_publish``（约 L1327-1391）的参数骨架为基准，追加 ``rt_tid``/``rt_uin``/``rt_con``
+            转发标识；参数形状靠通用 QZone API 知识 + 既有 publish 模式推断。首次开启由 sol 真机验证。
+
+            :param target_qq: 被转发说说作者的 QQ（uin）
+            :param feed_id: 被转发说说的 tid
+            :param original_content: 被转发的原始内容（防御性携带进 rt_con）
+            :param comment: bot 的转发配文（短评）
+            :return: ``(是否成功, 新说说tid)``；任何失败仅日志，返回 ``(False, "")``，绝不外溢。
+            """
+            try:
+                # 以 _publish 的字段为基准，追加转发标识字段
+                post_data = {
+                    "syn_tweet_verson": "1",
+                    "paramstr": "1",
+                    "who": "1",
+                    "con": comment,  # 转发配文（bot 的短评）
+                    "feedversion": "1",
+                    "ver": "1",
+                    "ugc_right": "1",
+                    "to_sign": "0",
+                    "hostuin": uin,
+                    "code_version": "1",
+                    "format": "json",
+                    "qzreferrer": f"https://user.qzone.qq.com/{uin}",
+                    # --- 相对 _publish 新增的转发标识（未经 live 验证）---
+                    "rt_tid": str(feed_id),  # 被转发说说 tid
+                    "rt_uin": str(target_qq),  # 被转发说说作者 uin
+                    "rt_con": original_content or "",  # 被转发内容（部分接口需要，防御性携带）
+                    "richtype": "",
+                    "richval": "",
+                }
+
+                res_text = await _request("POST", self.EMOTION_FORWARD_URL, params={"g_tk": gtk}, data=post_data)
+
+                # 多候选解析新 tid（不同接口版本字段名不一，防御性取值）
+                new_tid = ""
+                try:
+                    result = orjson.loads(res_text)
+                    if isinstance(result, dict):
+                        candidates: list[dict] = [result]
+                        if isinstance(result.get("data"), dict):
+                            candidates.append(result["data"])
+                        for src in candidates:
+                            for k in ("tid", "t1_tid", "new_tid", "fid"):
+                                v = src.get(k)
+                                if v:
+                                    new_tid = str(v)
+                                    break
+                            if new_tid:
+                                break
+                        # 拿不到 tid 且响应码非成功时，记录响应码便于首轮排查
+                        code = result.get("code", result.get("ret", 0))
+                        if not new_tid and code not in (0, None):
+                            message = result.get("message", result.get("msg", "未知错误"))
+                            logger.error(
+                                f"[转发] 转发API返回失败: code={code}, message={message}, src_tid={feed_id}"
+                            )
+                except orjson.JSONDecodeError:
+                    logger.warning(f"[转发] 转发API响应无法解析为JSON: {res_text[:200]}")
+
+                if new_tid:
+                    logger.info(f"[转发] 成功转发说说 作者={target_qq} 源tid={feed_id} 新tid={new_tid}")
+                else:
+                    logger.error(f"[转发] 转发未拿到新 tid（可能失败或接口形状不符），源tid={feed_id}")
+                return bool(new_tid), new_tid
+            except Exception as e:
+                logger.error(f"[转发] 转发说说异常: {e}")
+                return False, ""
+
+        logger.debug("API客户端构造完成，返回包含11个方法的字典")
         return {
             "publish": _publish,
             "list_feeds": _list_feeds,
@@ -2098,4 +2221,5 @@ class QZoneService:
             "get_count": _get_count,
             "get_visitors": _get_visitors,
             "get_likers": _get_likers,
+            "repost": _repost,
         }
