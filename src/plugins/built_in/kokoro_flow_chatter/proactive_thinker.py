@@ -270,13 +270,15 @@ class ProactiveThinker:
             # 获取关系信息
             relation_block = f"你与 {user_name} 还不太熟悉。"
             try:
-                from src.person_info.relationship_manager import relationship_manager
+                # 模块级 relationship_manager 是惰性单例（初始为 None，靠工厂实例化），
+                # 直接 from-import 会拿到 None，必须走 get_relationship_manager()
+                from src.person_info.relationship_manager import get_relationship_manager
 
                 person_info_manager = await self._get_person_info_manager()
                 if person_info_manager:
                     platform = global_config.bot.platform if global_config else "qq"
                     person_id = person_info_manager.get_person_id(platform, session.user_id)
-                    relationship = await relationship_manager.get_relationship(person_id)
+                    relationship = await get_relationship_manager().get_relationship(person_id)
                     if relationship:
                         relation_block = f"你与 {user_name} 的亲密度是 {relationship.intimacy}。{relationship.description or ''}"
             except Exception as e:
