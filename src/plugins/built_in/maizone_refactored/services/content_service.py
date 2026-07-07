@@ -551,6 +551,149 @@ class ContentService:
 
         return ""
 
+    async def select_feeds_to_comment(
+        self, candidates: list[dict], max_select: int = 3
+    ) -> list[dict] | None:
+        """
+        让 LLM 像真人刷空间一样浏览一批候选动态，主动挑出真正想评论的内容（可以一条都不选）。
+
+        遵守仓库缓存约定：人设 + 固定选择指导（静态大块）位于 CACHE_BREAKPOINT_MARKER 之前，
+        动态候选列表位于标记之后；anthropic 客户端会在标记处打缓存断点，其他客户端发送前自动剥离。
+
+        :param candidates: 候选动态列表，每项形如
+            {"author": 作者名, "time": 时间文本, "content": 内容摘要, "has_image": 是否带图}。
+            列表顺序即展示给 LLM 的序号顺序（序号从 1 开始）。
+        :param max_select: 本轮最多可选的动态数量上限。
+        :return:
+            - 选中项列表 [{"index": int, "reason": str}]，index 为 1 基序号，对应 candidates 顺序；
+            - 空列表 [] 表示 LLM 主动选择「一条都不评论」（正常结果，应被尊重）；
+            - None 表示选择流程失败（模型异常/JSON 解析失败），调用方应回退到原有逐条随机逻辑。
+        """
+        if not candidates:
+            return []
+
+        try:
+            # 获取模型配置（复用与评论生成相同的任务模型集）
+            models = llm_api.get_available_models()
+            text_model = str(self.get_config("models.text_model", "replyer"))
+            model_config = models.get(text_model)
+
+            if not model_config:
+                logger.error("未配置LLM模型，无法执行动态选择")
+                return None
+
+            # 机器人人格三要素（与评论生成保持一致的构建方式）
+            bot_personality_core = config_api.get_global_config("personality.personality_core", "一个友好的机器人")
+            bot_personality_side = config_api.get_global_config("personality.personality_side", "")
+            bot_reply_style = config_api.get_global_config("personality.reply_style", "内容积极向上")
+
+            personality_block = f"你的核心人格：{bot_personality_core}"
+            if bot_personality_side:
+                personality_block += f"\n你的人格侧面：{bot_personality_side}"
+            personality_block += f"\n你的表达方式：{bot_reply_style}"
+
+            # 静态选择指导（与人设一起构成缓存前缀，命中 prompt cache）
+            selection_guide = f"""# 平台说明
+
+**QQ空间**是记录生活、分享心情、与朋友互动的社交平台。好友会发表「说说」，你可以选择性地评论。
+
+# 人设定义
+
+{personality_block}
+
+# 你的任务
+
+你正在像真人一样刷 QQ 空间，下面会给你一批你还没有互动过的好友动态。
+请依据你的人设、兴趣和当下心情，从中挑出你**真正想评论、有话可说**的动态。
+
+## 选择原则
+1. 像人一样有选择：只挑真正感兴趣、能自然接话的内容，而不是机械地每条都评论。
+2. 与你人设、兴趣相关，或有互动价值（能表达共鸣、好奇、轻松调侃）的优先。
+3. **宁缺毋滥**：如果没有一条让你有评论欲望，就返回空的 selections，绝不为了评论而评论。
+4. 最多只选 {max_select} 条；即使有很多想评论的，也请挑你最想评论的前 {max_select} 条。
+
+## 输出格式（严格 JSON，不要输出任何多余内容）
+{{"thinking": "简述你的整体判断", "selections": [{{"index": 序号, "reason": "为什么想评论这条"}}]}}
+
+- index 是下方候选动态的序号（数字）。
+- 若一条都不想评论，则：{{"thinking": "...", "selections": []}}"""
+
+            # 动态候选列表（位于缓存断点之后）
+            candidate_lines = []
+            for idx, cand in enumerate(candidates, start=1):
+                author = cand.get("author") or "某位好友"
+                time_text = cand.get("time") or "未知时间"
+                has_image = "有" if cand.get("has_image") else "无"
+                content = (cand.get("content") or "").strip().replace("\n", " ")
+                if len(content) > 120:
+                    content = content[:120] + "…"
+                if not content:
+                    content = "（无文字内容，可能是纯图片/转发）"
+                candidate_lines.append(
+                    f"[{idx}] 作者：{author} | 时间：{time_text} | 配图：{has_image}\n内容：{content}"
+                )
+            candidate_block = "\n---\n".join(candidate_lines)
+
+            # 人设与固定指导在前、缓存断点、候选列表在后
+            prompt = f"""{selection_guide}
+{CACHE_BREAKPOINT_MARKER}
+# 候选动态（共 {len(candidates)} 条）
+
+{candidate_block}
+
+请现在输出你的选择（严格 JSON）。"""
+
+            success, response, _, _ = await llm_api.generate_with_model(
+                prompt=prompt,
+                model_config=model_config,
+                request_type="maizone.feed_selection",
+                temperature=0.5,
+                max_tokens=1000,
+            )
+
+            if not success or not response:
+                logger.warning("动态选择 LLM 调用未成功，将回退到逐条随机评论")
+                return None
+
+            # 容错解析 JSON（仓库通用 json_repair）
+            import json_repair
+
+            data = json_repair.loads(response)
+            if not isinstance(data, dict):
+                logger.warning(f"动态选择结果不是 JSON 对象，原始响应: {response[:200]}")
+                return None
+
+            thinking = str(data.get("thinking", "")).strip()
+            raw_selections = data.get("selections", [])
+            if not isinstance(raw_selections, list):
+                logger.warning(f"动态选择 selections 字段格式异常: {raw_selections!r}")
+                return None
+
+            selections: list[dict] = []
+            seen_index: set[int] = set()
+            for item in raw_selections:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    idx = int(item.get("index"))
+                except (TypeError, ValueError):
+                    continue
+                # 仅接受有效且不重复的序号
+                if idx < 1 or idx > len(candidates) or idx in seen_index:
+                    continue
+                seen_index.add(idx)
+                selections.append({"index": idx, "reason": str(item.get("reason", "")).strip()})
+                if len(selections) >= max_select:
+                    break
+
+            if thinking:
+                logger.info(f"动态选择思考: {thinking[:150]}")
+            return selections
+
+        except Exception as e:
+            logger.warning(f"执行动态选择时发生异常: {e}")
+            return None
+
     async def generate_qzone_comment(
         self,
         target_name: str,

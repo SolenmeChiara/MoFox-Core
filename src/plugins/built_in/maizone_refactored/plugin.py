@@ -68,7 +68,14 @@ class MaiZoneRefactoredPlugin(BasePlugin):
             "permission_type": ConfigField(type=str, default="blacklist", description="权限类型"),
             "read_number": ConfigField(type=int, default=5, description="一次读取的说说数量"),
             "like_possibility": ConfigField(type=float, default=1.0, description="点赞概率"),
-            "comment_possibility": ConfigField(type=float, default=0.3, description="评论概率"),
+            "comment_possibility": ConfigField(type=float, default=0.3, description="评论概率（仅在关闭LLM选择时作为逐条随机回退使用）"),
+        },
+        "selection": {
+            "enable_llm_selection": ConfigField(
+                type=bool, default=True, description="是否启用LLM主动挑选值得评论的动态（关闭则沿用逐条随机评论）"
+            ),
+            "candidate_limit": ConfigField(type=int, default=8, description="一次交给LLM挑选的候选动态数量上限"),
+            "max_comments_per_round": ConfigField(type=int, default=3, description="单轮最多评论的动态数量"),
         },
         "monitor": {
             "enable_auto_monitor": ConfigField(type=bool, default=False, description="是否启用自动监控"),

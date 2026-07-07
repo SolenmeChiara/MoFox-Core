@@ -241,10 +241,24 @@ class QZoneService:
                     return {"success": True, "message": f"没有从'{target_name}'的空间获取到新说说。"}
 
                 logger.debug(f"准备处理 {len(feeds)} 条说说")
+
+                # --- LLM 选择评论目标（可配置开关；失败则回退到逐条随机） ---
+                decision_map: dict[str, bool] | None = None
+                if self.get_config("selection.enable_llm_selection", True):
+                    try:
+                        decision_map = await self._select_comment_targets(feeds, lambda _f: target_name)
+                    except Exception as e:
+                        logger.warning(f"LLM 选择评论目标异常，回退到逐条随机评论: {e}")
+                        decision_map = None
+
                 total_liked = 0
                 total_commented = 0
                 for feed in feeds:
-                    result = await self._process_single_feed(feed, api_client, str(target_qq), target_name)
+                    fid = feed.get("tid", "")
+                    comment_decision = decision_map.get(fid, False) if decision_map is not None else None
+                    result = await self._process_single_feed(
+                        feed, api_client, str(target_qq), target_name, comment_decision
+                    )
                     if result["liked"]:
                         total_liked += 1
                     if result["commented"]:
@@ -338,13 +352,29 @@ class QZoneService:
                     return
 
                 logger.info(f"监控任务: 发现 {len(friend_feeds)} 条好友新动态，准备处理...")
+
+                # --- LLM 选择评论目标（可配置开关；失败则回退到逐条随机） ---
+                decision_map: dict[str, bool] | None = None
+                if self.get_config("selection.enable_llm_selection", True):
+                    try:
+                        decision_map = await self._select_comment_targets(
+                            friend_feeds, lambda f: str(f.get("target_qq", ""))
+                        )
+                    except Exception as e:
+                        logger.warning(f"LLM 选择评论目标异常，回退到逐条随机评论: {e}")
+                        decision_map = None
+
                 monitor_stats = {"total": 0, "liked": 0, "commented": 0}
                 for feed in friend_feeds:
                     target_qq = feed.get("target_qq")
                     if not target_qq or str(target_qq) == str(qq_account):  # 确保不重复处理自己的
                         continue
 
-                    result = await self._process_single_feed(feed, api_client, str(target_qq), str(target_qq))
+                    fid = feed.get("tid", "")
+                    comment_decision = decision_map.get(fid, False) if decision_map is not None else None
+                    result = await self._process_single_feed(
+                        feed, api_client, str(target_qq), str(target_qq), comment_decision
+                    )
                     monitor_stats["total"] += 1
                     if result.get("liked"):
                         monitor_stats["liked"] += 1
@@ -488,8 +518,101 @@ class QZoneService:
                 self.reply_tracker.remove_reply_record(fid, comment_tid)
                 logger.debug(f"已清理删除的回复记录: feed_id={fid}, comment_id={comment_tid}")
 
-    async def _process_single_feed(self, feed: dict, api_client: dict, target_qq: str, target_name: str) -> dict:
+    async def _select_comment_targets(self, feeds: list[dict], author_of: Callable[[dict], str]) -> dict[str, bool] | None:
+        """对一批说说执行 LLM 选择：像人一样挑出真正值得评论的目标。
+
+        :param feeds: 说说列表（元素需含 tid、content、rt_con、images 等字段）。
+        :param author_of: 回调，传入单条 feed 返回作者展示名。
+        :return:
+            - dict[fid -> bool]：评论决策表（True=选中评论，False=看过但不评论）。
+              未被选中的候选会同时被标记为「看过无兴趣」，防止下一轮重复进入候选。
+            - None：选择失败，调用方应回退到原有逐条随机评论逻辑。
+        """
+        candidate_limit = int(self.get_config("selection.candidate_limit", 8))
+        max_comments = int(self.get_config("selection.max_comments_per_round", 3))
+
+        # 收集未处理过的候选（既未评论过，也未被标记为「看过无兴趣」），复用 reply_tracker 去重
+        candidates: list[dict] = []
+        for feed in feeds:
+            fid = feed.get("tid", "")
+            if not fid:
+                continue
+            if self.reply_tracker.has_replied(fid, "main_comment") or self.reply_tracker.has_replied(
+                fid, "seen_no_comment"
+            ):
+                continue
+            candidates.append(feed)
+            if len(candidates) >= candidate_limit:
+                break
+
+        if not candidates:
+            # 没有新候选，返回空决策表（本批 feed 一律不评论）
+            return {}
+
+        # 构建给 LLM 的精简候选信息（作者、时间、内容摘要、是否带图）
+        payload: list[dict] = []
+        for feed in candidates:
+            content = feed.get("content", "")
+            rt_con = (
+                feed.get("rt_con", {}).get("content", "")
+                if isinstance(feed.get("rt_con"), dict)
+                else feed.get("rt_con", "")
+            )
+            payload.append(
+                {
+                    "author": author_of(feed),
+                    "time": feed.get("created_time", "") or "",
+                    "content": content or rt_con or "",
+                    "has_image": bool(feed.get("images")),
+                }
+            )
+
+        selections = await self.content_service.select_feeds_to_comment(payload, max_select=max_comments)
+        if selections is None:
+            # 选择失败（模型/解析异常）→ 让调用方回退到逐条随机
+            return None
+
+        # 依据序号映射回 feed，构建决策表
+        selected_fids: set[str] = set()
+        for sel in selections:
+            i = sel["index"] - 1
+            if 0 <= i < len(candidates):
+                fid = candidates[i].get("tid", "")
+                if fid:
+                    selected_fids.add(fid)
+
+        decision: dict[str, bool] = {}
+        for feed in candidates:
+            fid = feed.get("tid", "")
+            if not fid:
+                continue
+            if fid in selected_fids:
+                decision[fid] = True
+            else:
+                decision[fid] = False
+                # 标记为「看过但没兴趣评论」，防止下一轮再次进入候选被反复评估
+                self.reply_tracker.mark_as_replied(fid, "seen_no_comment")
+
+        # 选择阶段日志（便于观察「选择感」）
+        if selected_fids:
+            briefs = []
+            for sel in selections:
+                i = sel["index"] - 1
+                if 0 <= i < len(payload):
+                    reason = sel.get("reason", "") or "（未说明理由）"
+                    briefs.append(f"[{sel['index']}]{payload[i]['author']}: {reason}")
+            logger.info(f"[空间选择] 候选 {len(candidates)} 条 → 选中 {len(briefs)} 条：" + "；".join(briefs))
+        else:
+            logger.info(f"[空间选择] 候选 {len(candidates)} 条 → 本轮没有想评论的动态，跳过评论")
+
+        return decision
+
+    async def _process_single_feed(
+        self, feed: dict, api_client: dict, target_qq: str, target_name: str, comment_decision: bool | None = None
+    ) -> dict:
         """处理单条说说，决定是否评论和点赞
+
+        :param comment_decision: 评论决策。None=沿用原有逐条随机；True=LLM 选中，评论；False=LLM 未选中，跳过评论。
 
         返回:
             dict: {"liked": bool, "commented": bool}
@@ -504,7 +627,11 @@ class QZoneService:
 
         # --- 处理评论 ---
         comment_key = f"{fid}_main_comment"
-        should_comment = random.random() <= self.get_config("read.comment_possibility", 0.3)
+        # comment_decision: None=沿用原有逐条随机；True=LLM 选中评论；False=LLM 未选中跳过
+        if comment_decision is None:
+            should_comment = random.random() <= self.get_config("read.comment_possibility", 0.3)
+        else:
+            should_comment = comment_decision
 
         if (
             should_comment
