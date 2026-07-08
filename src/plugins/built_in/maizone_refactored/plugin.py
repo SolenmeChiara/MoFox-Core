@@ -21,6 +21,7 @@ from .services.cookie_service import CookieService
 from .services.image_service import ImageService
 from .services.manager import register_service
 from .services.monitor_service import MonitorService
+from .services.own_thread_tracking_service import OwnThreadTrackingService
 from .services.person_memory_service import PersonMemoryService
 from .services.qzone_service import QZoneService
 from .services.reply_tracker_service import ReplyTrackerService
@@ -85,6 +86,21 @@ class MaiZoneRefactoredPlugin(BasePlugin):
             "enable_auto_monitor": ConfigField(type=bool, default=False, description="是否启用自动监控"),
             "interval_minutes": ConfigField(type=int, default=10, description="监控间隔分钟数"),
             "enable_auto_reply": ConfigField(type=bool, default=False, description="是否启用自动回复自己说说的评论"),
+            "enable_own_thread_reply": ConfigField(
+                type=bool,
+                default=True,
+                description="是否启用自己说说「自楼接话」：拉完整评论楼发现别人回复 bot 评论的楼中楼/平铺@并定向接话"
+                "（修 msglist 楼中楼盲区，默认开启；首轮基线播种不回复历史）",
+            ),
+            "own_thread_max_replies_per_round": ConfigField(
+                type=int, default=3, description="自楼接话单轮最多接话总次数（跨所有自己说说）"
+            ),
+            "own_thread_per_feed_limit": ConfigField(
+                type=int, default=2, description="同一条自己说说里最多接话次数（防无限对聊刷楼）"
+            ),
+            "own_thread_tracking_ttl_hours": ConfigField(
+                type=int, default=168, description="一条自己说说追踪多久（小时），超时不再轮询其楼中楼回复"
+            ),
         },
         "schedule": {
             "enable_schedule": ConfigField(type=bool, default=False, description="是否启用定时发送"),
@@ -206,6 +222,8 @@ class MaiZoneRefactoredPlugin(BasePlugin):
         reply_tracker_service = ReplyTrackerService()
         # 好友说说接话闭环：追踪 bot 评论过的好友说说，供 QZoneService.check_comment_replies 轮询
         comment_tracking_service = CommentTrackingService()
+        # 自己说说「自楼接话」：基线播种 + 去重 + 防刷楼 + 便宜信号闸，供 _process_own_thread_replies
+        own_thread_tracking_service = OwnThreadTrackingService()
         # 转发锐评风控追踪：永久转发记录 + 每日计数 + 好友级 / 尝试冷却
         repost_tracking_service = RepostTrackingService()
 
@@ -217,6 +235,7 @@ class MaiZoneRefactoredPlugin(BasePlugin):
             reply_tracker_service,
             person_memory=person_memory_service,
             comment_tracking=comment_tracking_service,
+            own_thread_tracking=own_thread_tracking_service,
         )
         scheduler_service = SchedulerService(self.get_config, qzone_service)
         # 社交闭环服务：计数门 + 访客回访 + 回赞 + 转发锐评，注入监控服务由其定时循环驱动
