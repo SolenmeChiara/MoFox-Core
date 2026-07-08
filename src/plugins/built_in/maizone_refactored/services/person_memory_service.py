@@ -79,7 +79,7 @@ class PersonMemoryService:
     # ---------------- 1. 注册 ----------------
 
     async def register_person(self, qq: str | int | None, nickname: str | None = None) -> None:
-        """把对方注册进 person_info 记人系统（已存在则跳过）。
+        """把对方注册进 person_info 记人系统（已存在则跳过），并顺带自愈历史坏昵称。
 
         :param qq: 对方 QQ 号。
         :param nickname: 对方昵称（能拿到就带上，拿不到时回退为 QQ 号）。
@@ -90,16 +90,78 @@ class PersonMemoryService:
             # 与 kokoro / social_toolkit 等内置插件一致，直接使用 person_info 单例
             from src.person_info.person_info import get_person_info_manager
 
-            name = (str(nickname).strip() if nickname else "") or str(qq)
+            raw_nickname = str(nickname).strip() if nickname else ""
+            name = raw_nickname or str(qq)
+            manager = get_person_info_manager()
             # get_or_create_person 内部：不存在则创建、已存在则直接返回，且不触发取名 LLM
-            await get_person_info_manager().get_or_create_person(
+            await manager.get_or_create_person(
                 platform="qq",
                 user_id=qq,
                 nickname=name,
                 user_cardname="",
             )
+            # 自愈：早期监控路径曾把 QQ 号当昵称写进记录，这里在拿到真名时顺手修正历史坏记录
+            await self._heal_numeric_nickname(manager, qq, raw_nickname)
         except Exception as e:
             logger.warning(f"注册空间互动对象到记人系统失败(qq={qq}): {e}")
+
+    async def _heal_numeric_nickname(self, manager: Any, qq: str | int, raw_nickname: str) -> None:
+        """自愈：修正历史被误写成「纯数字 QQ 号」的 nickname / person_name。
+
+        仅当调用方带来了「真昵称」（非空、不等于 QQ 号、且不是纯数字）时才尝试；对 person_info
+        里仍为纯数字且等于 user_id 的字段做修正：
+        - nickname 可放心更新；
+        - person_name 走取名系统的唯一性通道（_generate_unique_person_name）避免撞名，并同步刷新
+          name_reason；且仅在它同样是纯数字且等于 user_id 时才动，不覆盖取名 LLM 起过的名字。
+
+        整体 try/except，失败只告警，绝不影响主流程（与本文件其它方法一致的失败隔离风格）。
+        """
+        try:
+            user_id = str(qq)
+            real_name = str(raw_nickname).strip() if raw_nickname else ""
+            # 没有拿到真名，或真名本身就是纯数字 / 等于 QQ 号 → 无从修正，直接返回
+            if not real_name or real_name == user_id or real_name.isdigit():
+                return
+
+            from src.person_info.person_info import PersonInfoManager
+
+            person_id = manager.get_person_id("qq", qq)
+            # 读取与下方缓存失效必须用同一个字段列表（内容与顺序一致）：
+            # get_values 的 @cached 键是对 (person_id, field_names) 整体做的 hash
+            fields = ["nickname", "person_name"]
+            current = await manager.get_values(person_id, fields)
+            if not current:
+                return
+            cur_nickname = str(current.get("nickname") or "")
+            cur_person_name = str(current.get("person_name") or "")
+
+            # 「坏值」判定：纯数字且等于 user_id（即当年把 QQ 号当昵称写进去了）
+            def _is_numeric_qq(value: str) -> bool:
+                return bool(value) and value.isdigit() and value == user_id
+
+            healed = False
+            if _is_numeric_qq(cur_nickname):
+                await manager.update_one_field(person_id, "nickname", real_name)
+                healed = True
+            if _is_numeric_qq(cur_person_name):
+                # 走官方唯一性通道，避免与他人的 person_name 撞名
+                unique_name = await PersonInfoManager._generate_unique_person_name(real_name)
+                await manager.update_one_field(person_id, "person_name", unique_name)
+                await manager.update_one_field(person_id, "name_reason", "从QQ空间动态获取昵称")
+                healed = True
+
+            if healed:
+                # 显式失效 get_values 的缓存：update_one_field 内置的失效键只 hash 了 person_id，
+                # 与 @cached 对 (person_id, field_names) 生成的键不匹配（实测键值不同），若不补删，
+                # 600s 内同一 QQ 再次真名互动会命中脏缓存、误判 person_name 仍是坏值而反复重命名。
+                from src.common.database.optimization.cache_manager import get_cache
+                from src.common.database.utils.decorators import generate_cache_key
+
+                cache = await get_cache()
+                await cache.delete(generate_cache_key("person_values", person_id, fields))
+                logger.info(f"[记人] 修正昵称: {user_id} → {real_name}")
+        except Exception as e:
+            logger.warning(f"[记人] 自愈昵称修正失败(qq={qq}): {e}")
 
     # ---------------- 2. 积累 ----------------
 

@@ -524,7 +524,7 @@ class QZoneService:
                     fid = feed.get("tid", "")
                     comment_decision = decision_map.get(fid, False) if decision_map is not None else None
                     result = await self._process_single_feed(
-                        feed, api_client, str(target_qq), str(target_qq), comment_decision
+                        feed, api_client, str(target_qq), feed.get("target_name") or str(target_qq), comment_decision
                     )
                     monitor_stats["total"] += 1
                     if result.get("liked"):
@@ -1946,6 +1946,22 @@ class QZoneService:
                     if is_liked:
                         continue
 
+                    # 提取动态作者本人昵称：优先外层 JSON 条目的 nickname 字段（feeds3 接口通常带），
+                    # 拿不到再从 HTML 作者名节点兜底（QQ空间 feed 卡片作者链接常为 <a class="f-name q_namecard">），
+                    # 都拿不到就留空串（调用方以 QQ 号兜底），全程防御性判空。
+                    target_name = ""
+                    raw_nick = feed.get("nickname") or feed.get("name") or ""
+                    if isinstance(raw_nick, str):
+                        target_name = raw_nick.strip()
+                    if not target_name:
+                        author_node = (
+                            soup.find("a", class_="f-name")
+                            or soup.find("a", class_="q_namecard")
+                            or soup.select_one(".f-name")
+                        )
+                        if isinstance(author_node, bs4.Tag):
+                            target_name = author_node.get_text(strip=True)
+
                     # 提取说说主体内容（兼容普通说说和转发说说）
                     text_div = soup.find("div", class_="f-info")
                     if not text_div:
@@ -2025,7 +2041,15 @@ class QZoneService:
                                 )
 
                     feeds_list.append(
-                        {"target_qq": target_qq, "tid": tid, "content": text, "rt_con": rt_con, "images": images, "comments": comments}
+                        {
+                            "target_qq": target_qq,
+                            "tid": tid,
+                            "target_name": target_name,
+                            "content": text,
+                            "rt_con": rt_con,
+                            "images": images,
+                            "comments": comments,
+                        }
                     )
                 logger.info(f"监控任务发现 {len(feeds_list)} 条未处理的新说说。")
                 return feeds_list
