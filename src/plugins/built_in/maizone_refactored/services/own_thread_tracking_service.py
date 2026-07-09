@@ -14,7 +14,9 @@
                                       #   变化才拉 msgdetail。沿用旧字段名、不迁移旧数据）
         "last_detail_ts": float,      # 上次为本 feed 拉 msgdetail 的时间戳（兜底强刷判断依据）
         "baseline_seeded": bool,      # 是否已完成基线播种（首轮把现存候选全部标记已见、不回复）
-        "seen_reply_keys": [str],     # 已处理过的回复去重 key（"<uin>_<tid>"）
+        "seen_reply_keys": [str],     # 已处理过的回复去重 key。v2 格式 "v2:<parent_tid>:<uin>:<tid>"
+                                      #   （由 qzone_service._own_thread_seen_key 生成；v1 裸 "<uin>_<tid>"
+                                      #   会与顶层评论 tid 撞命名空间，已废弃，cleanup 时顺手剔除）
         "replied_uins": [str],        # 本 feed 内 bot 已接过话的人（同一个人只接一次，防对喷循环）
         "reply_count": int,           # 本 feed 内 bot 的接话次数（防无限对聊刷楼）
         "updated_at": float           # 最后更新时间戳（TTL 清理依据）
@@ -211,7 +213,7 @@ class OwnThreadTrackingService:
     # ---------------- 清理 ----------------
 
     def cleanup(self, ttl_seconds: float) -> None:
-        """清理超过 TTL 的追踪条目（按 updated_at）。"""
+        """清理超过 TTL 的追踪条目（按 updated_at），并顺手剔除 v2 之前的旧格式 seen key。"""
         now = time.time()
         expired = []
         for fid, entry in self.tracked.items():
@@ -223,6 +225,21 @@ class OwnThreadTrackingService:
                 expired.append(fid)
         for fid in expired:
             del self.tracked[fid]
-        if expired:
+        # 顺手剔除旧格式 seen key（v1 裸 "<uin>_<tid>"）：新键一律带 "v2:" 前缀，旧键已不可能再被
+        # has_seen 匹配，留着只占空间；被跨路去重误标的旧键剔除后，对应积压候选可重新进入处理。
+        pruned = 0
+        for entry in self.tracked.values():
+            if not isinstance(entry, dict):
+                continue
+            keys = entry.get("seen_reply_keys")
+            if isinstance(keys, list):
+                kept = [k for k in keys if isinstance(k, str) and k.startswith("v2:")]
+                if len(kept) != len(keys):
+                    pruned += len(keys) - len(kept)
+                    entry["seen_reply_keys"] = kept
+        if expired or pruned:
             self._persist()
+        if expired:
             logger.info(f"[自楼接话] 清理了 {len(expired)} 条过期的追踪记录")
+        if pruned:
+            logger.info(f"[自楼接话] 剔除了 {pruned} 条旧格式(v1) seen key，对应积压候选将重新评估")

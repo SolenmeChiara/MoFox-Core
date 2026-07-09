@@ -281,6 +281,34 @@ def _parse_comment_tree(commentlist: Any) -> list[dict]:
     return comments
 
 
+def _parse_at_target(content: str) -> str:
+    """从楼中楼回复 content 的 ``@`` 前缀解析出「被回复对象」的昵称。
+
+    QZone 楼中楼回复常自动带「回复@昵称：正文」或「@昵称 正文」前缀。取第一个 ``@`` 之后、到最近一个
+    分隔符（``：`` / ``:`` / 空白 / ``，`` / ``,``）之前的昵称，解析不到返回 ""。仅用于「自楼接话」
+    路(a′) 的内容闸兜底，best-effort，失败不影响主流程。
+    """
+    if not content or "@" not in content:
+        return ""
+    after = content.split("@", 1)[1]
+    cut = len(after)
+    for sep in ("：", ":", " ", "　", " ", "\t", "\n", "，", ","):
+        idx = after.find(sep)
+        if idx != -1 and idx < cut:
+            cut = idx
+    return after[:cut].strip()
+
+
+def _own_thread_seen_key(node: dict) -> str:
+    """自楼接话去重 key（v2）：``v2:{parent_tid}:{uin}:{tid}``，与旧格式 ``{uin}_{tid}`` 天然不兼容。
+
+    旧格式只用 ``{uin}_{tid}``：楼中楼子回复 tid 与顶层评论 tid 是两条独立小整数序列，既会自撞，也让
+    被「跨路去重撞命名空间」误标的 key 永久挡住积压回复。v2 加 ``v2:`` 前缀 + parent_tid 后，旧 key 在
+    ``has_seen`` 里自然失效（不再匹配），被误挡的积压候选下次拉到详情时重新进入处理。
+    """
+    return f"v2:{node.get('parent_tid')}:{node.get('qq_account')}:{node.get('comment_tid')}"
+
+
 class QZoneService:
     """
     QQ空间服务类，负责所有API交互和业务流程编排。
@@ -864,7 +892,7 @@ class QZoneService:
         bot_last_ts: int,
         bot_name: str,
     ) -> list[dict]:
-        """在「自己说说」的完整评论楼里，双路检测「冲着 bot 来的回复」（按时间升序，先接早的）。
+        """在「自己说说」的完整评论楼里，三路检测「冲着 bot 来的回复」（按时间升序，先接早的）。
 
         改造自 ``_detect_replies_to_bot``（好友接话闭环）。语义差异：那里 bot 是评论者、只有唯一
         一条顶层评论作为「bot 的楼」；这里 bot 是楼主，bot 的「楼」是一个**集合** ``bot_tids``。
@@ -876,21 +904,50 @@ class QZoneService:
 
         路 (a) 楼中楼：``list_3`` 里 ``parent_tid`` 落在 ``bot_tids`` 中的子回复（别人回复 bot 的评论）。
                  时间门：晚于该 bot 楼（``bot_tid_ts[parent]``）的活动时间才算新。
+        路 (a′) bot 参与过的楼：真机实证（2026-07-09）QZone 会把「回复楼中楼」的 ``parent_tid`` **归并
+                 到顶层楼 tid**（而非被回复的 bot 子回复 tid），路 (a) 因此漏检。补路：bot 在某顶层楼的
+                 ``list_3`` 里发过子回复（uin==bot 且 parent==该顶层 tid），则该楼里晚于 bot 在该楼最后
+                 活动时间、uin≠bot 的新子回复即为候选。为避免误接「两好友在同一楼里互聊」，加内容闸：
+                 候选 content 含 ``@bot昵称``（QZone 回复楼中楼通常自动带「回复@xxx：」前缀），**或**
+                 候选作者昵称 == bot 在该楼最后一条回复 ``@`` 的对象（从 bot 评论 content 的 @ 前缀
+                 解析，见 ``_parse_at_target``；解析不到就只靠 @bot 闸）。
         路 (b) 平铺 level-2：``uin != bot`` 且 content 含 ``@bot昵称`` 的顶层评论。时间门用 ``bot_last_ts``
                  （bot 最近一次评论时间）兜底。
 
-        楼主（=bot）说说下两个好友互相聊天的楼中楼（parent 指向非 bot 楼）**不命中**，避免插嘴。
-        时间戳缺失时放宽时间门，改由上层 seen 去重兜底。
+        楼主（=bot）说说下两个好友互相聊天的楼中楼（parent 指向非 bot 楼、且过不了路 (a′) 的内容闸）
+        **不命中**，避免插嘴。时间戳缺失时放宽时间门，改由上层 seen 去重兜底。
         """
         bot_qq = str(bot_qq or "")
         bot_tids = {str(t) for t in bot_tids if t is not None}
         at_token = f"@{bot_name}" if bot_name else None
 
+        # 路 (a′) 预扫：bot 以子回复形式参与过的顶层楼。
+        # thread_last_ts:     顶层楼 tid -> bot 在该楼内最后一条子回复的时间戳（时间门锚点）
+        # thread_last_target: 顶层楼 tid -> bot 最后那条子回复 @ 的对象昵称（内容闸兜底，解析不到为 ""）
+        thread_last_ts: dict[str, int] = {}
+        thread_last_target: dict[str, str] = {}
+        for c in comments:
+            if not isinstance(c, dict) or not c.get("is_sub"):
+                continue
+            if str(c.get("qq_account", "") or "") != bot_qq:
+                continue
+            parent = c.get("parent_tid")
+            if parent is None:
+                continue
+            p = str(parent)
+            c_ts = c.get("create_ts", 0) or 0
+            # 同楼多条 bot 回复取最晚的；时间戳缺失（=0）时也记录参与，时间门由缺失分支放宽
+            if p not in thread_last_ts or c_ts >= thread_last_ts[p]:
+                thread_last_ts[p] = c_ts
+                thread_last_target[p] = _parse_at_target(str(c.get("content", "") or ""))
+
         found: list[dict] = []
         seen_local: set[str] = set()
 
         def _push(node: dict) -> None:
-            k = f"{node.get('qq_account')}_{node.get('comment_tid')}"
+            # 本地去重键复用 v2 格式（带 parent_tid）：顶层 tid 与子回复 tid 是两条独立小整数序列，
+            # 裸 "uin_tid" 会让「同一人的顶层评论与楼中楼回复恰好同 tid」互撞、静默丢一条
+            k = _own_thread_seen_key(node)
             if k not in seen_local:
                 seen_local.add(k)
                 found.append(node)
@@ -903,15 +960,42 @@ class QZoneService:
                 continue
             c_ts = c.get("create_ts", 0) or 0
 
-            # 路 (a): 楼中楼子回复，parent 落在 bot 的某个楼里
+            # 路 (a)/(a′): 楼中楼子回复
             if c.get("is_sub"):
                 parent = str(c.get("parent_tid")) if c.get("parent_tid") is not None else None
-                if parent is None or parent not in bot_tids:
+                if parent is None:
                     continue
-                gate = bot_tid_ts.get(parent, 0) or 0
-                later = (c_ts == 0 or gate == 0) or (c_ts >= gate)
-                if later:
-                    _push(c)
+                # 路 (a): parent 直接指向 bot 的某条评论
+                if parent in bot_tids:
+                    gate = bot_tid_ts.get(parent, 0) or 0
+                    later = (c_ts == 0 or gate == 0) or (c_ts >= gate)
+                    if later:
+                        _push(c)
+                    else:
+                        logger.debug(
+                            f"[自楼接话] 检测跳过:时间门(路a) key={_own_thread_seen_key(c)} ts={c_ts}<门{gate}"
+                        )
+                    continue
+                # 路 (a′): parent 被 QZone 归并到顶层楼 tid，但 bot 在这楼里说过话
+                if parent in thread_last_ts:
+                    gate = thread_last_ts.get(parent, 0) or 0
+                    later = (c_ts == 0 or gate == 0) or (c_ts >= gate)
+                    if not later:
+                        logger.debug(
+                            f"[自楼接话] 检测跳过:时间门(路a′) key={_own_thread_seen_key(c)} ts={c_ts}<门{gate}"
+                        )
+                        continue
+                    content = str(c.get("content", "") or "")
+                    mentions_bot = bool(at_token and at_token in content)
+                    target = thread_last_target.get(parent, "")
+                    nickname = str(c.get("nickname", "") or "")
+                    is_bot_target = bool(target and nickname and nickname == target)
+                    if mentions_bot or is_bot_target:
+                        _push(c)
+                    else:
+                        logger.debug(
+                            f"[自楼接话] 检测跳过:内容闸(路a′，疑似好友互聊) key={_own_thread_seen_key(c)}"
+                        )
                 continue
 
             # 路 (b): 平铺 level-2 顶层评论，仅当 content 明确 @bot昵称
@@ -920,6 +1004,10 @@ class QZoneService:
             later = (c_ts == 0 or bot_last_ts == 0) or (c_ts >= bot_last_ts)
             if later:
                 _push(c)
+            else:
+                logger.debug(
+                    f"[自楼接话] 检测跳过:时间门(路b) key={_own_thread_seen_key(c)} ts={c_ts}<门{bot_last_ts}"
+                )
 
         found.sort(key=lambda x: x.get("create_ts", 0) or 0)
         return found
@@ -1070,9 +1158,9 @@ class QZoneService:
             )
             candidates_total += len(candidates)
 
-            # 首轮：基线播种——把现存候选全部记为已见、不回复
+            # 首轮：基线播种——把现存候选全部记为已见、不回复（v2 格式 key，见 _own_thread_seen_key）
             if needs_baseline:
-                keys = [f"{c.get('qq_account')}_{c.get('comment_tid')}" for c in candidates]
+                keys = [_own_thread_seen_key(c) for c in candidates]
                 self.own_thread_tracking.seed_baseline(fid, signal, keys)
                 baseline_total += len(keys)
                 logger.info(f"[自楼接话] 基线播种 {len(keys)} 条（fid={fid}，不回复历史）")
@@ -1085,27 +1173,40 @@ class QZoneService:
             images = feed.get("images", []) or []
             for rep in candidates:
                 if round_replies >= max_per_round:
+                    logger.debug(f"[自楼接话] 跳过:本轮全局上限({max_per_round})已满 fid={fid}，余候选留待下轮")
                     capped = True
                     break
                 replier_uin = str(rep.get("qq_account", "") or "")
                 rep_tid = rep.get("comment_tid")
                 if not replier_uin or rep_tid is None:
+                    logger.debug(f"[自楼接话] 跳过:候选缺uin或tid fid={fid} uin={replier_uin} tid={rep_tid}")
                     continue
-                key = f"{replier_uin}_{rep_tid}"
+                key = _own_thread_seen_key(rep)
 
                 if self.own_thread_tracking.has_seen(fid, key):
+                    logger.debug(f"[自楼接话] 跳过:已见过(has_seen) fid={fid} key={key}")
                     continue
                 # 先标记已见（无论后续生成/回复成败或拒答，都不再每轮重试）
                 self.own_thread_tracking.mark_reply_seen(fid, key)
 
                 # 防刷楼 1：本 feed 接话次数达上限
                 if self.own_thread_tracking.get_reply_count(fid) >= per_feed_limit:
+                    logger.debug(f"[自楼接话] 跳过:本楼接话数达上限({per_feed_limit}) fid={fid} key={key}")
                     continue
                 # 防刷楼 2：同一 feed 的同一个人只接一次
                 if self.own_thread_tracking.has_replied_to(fid, replier_uin):
+                    logger.debug(f"[自楼接话] 跳过:本楼已接过此人(replied_uins) fid={fid} key={key}")
                     continue
-                # 跨路去重：顶层评论回复路（_reply_to_own_feed_comments）已回过则不重复
-                if self.reply_tracker.has_replied(fid, rep_tid):
+                # 跨路去重（缺陷A修复）：楼中楼子回复 tid 与顶层评论 tid 是两条独立的小整数序列，
+                # 共用 (fid, tid) 命名空间会被 auto_reply 标记过的顶层 tid 误杀——子回复一律改用
+                # "thread_{parent_tid}_{tid}" 前缀键与之彻底隔离；平铺顶层候选（路 b）与 auto_reply
+                # 面对的是同一条顶层评论，保留裸 tid 键做真正的跨路去重（防两路对同一条评论双回）。
+                if rep.get("is_sub"):
+                    tracker_key = f"thread_{rep.get('parent_tid')}_{rep_tid}"
+                else:
+                    tracker_key = str(rep_tid)
+                if self.reply_tracker.has_replied(fid, tracker_key):
+                    logger.debug(f"[自楼接话] 跳过:reply_tracker已回过 fid={fid} tracker_key={tracker_key}")
                     continue
 
                 replier_name = rep.get("nickname", "") or replier_uin
@@ -1142,8 +1243,8 @@ class QZoneService:
                     continue
 
                 if ok:
-                    # 跨路去重 + 本路防刷楼记账
-                    self.reply_tracker.mark_as_replied(fid, rep_tid)
+                    # 跨路去重（与上方 has_replied 同键：子回复带 thread_ 前缀）+ 本路防刷楼记账
+                    self.reply_tracker.mark_as_replied(fid, tracker_key)
                     self.own_thread_tracking.record_reply(fid, replier_uin)
                     round_replies += 1
                     logger.info(f"[自楼接话] 在自己说说楼里接了 {replier_name} 的话: '{reply_content}'")
