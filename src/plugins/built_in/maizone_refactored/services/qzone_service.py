@@ -796,7 +796,10 @@ class QZoneService:
                     images=images,  # 传递说说中的图片
                 )
                 if reply_content:
-                    success = await api_client["reply"](fid, qq_account, nickname, reply_content, comment_tid)
+                    # 楼中楼：被回复评论作者 = 评论者本人（commenter_qq）；commentId = 该顶层评论 tid
+                    success = await api_client["reply"](
+                        fid, qq_account, nickname, reply_content, comment_tid, commenter_qq
+                    )
                     if success:
                         self.reply_tracker.mark_as_replied(fid, comment_tid)
                         logger.info(f"成功回复'{nickname}'的评论: '{reply_content}'")
@@ -1237,7 +1240,15 @@ class QZoneService:
                     continue
 
                 try:
-                    ok = await api_client["reply"](fid, qq_account, replier_name, reply_content, rep_tid)
+                    # 楼中楼语义（nested-on 时）：
+                    #   commentUin = 被回复的那个人（replier_uin，子回复作者）——与 commentId 是不同主体；
+                    #   commentId  = 该子回复归并后的**顶层楼锚点**（rep.parent_tid），不是子回复自己的 rep_tid。
+                    # QZone 楼中楼只一层、parent 全归并到顶层，锚点必须挂顶层楼，否则挂错层/触发 -10049。
+                    # 平铺顶层候选（路 b）无 parent_tid，回退用裸 rep_tid。off 路仍用第5参 rep_tid 当 parent_tid（零变化）。
+                    nested_top_tid = rep.get("parent_tid") or rep_tid
+                    ok = await api_client["reply"](
+                        fid, qq_account, replier_name, reply_content, rep_tid, replier_uin, nested_top_tid
+                    )
                 except Exception as e:
                     logger.error(f"[自楼接话] 回复接口异常(fid={fid}, uin={replier_uin}): {e}")
                     continue
@@ -1696,9 +1707,12 @@ class QZoneService:
                         logger.info(f"[接话] 对 {replier_name} 的回复选择不接话（客套/无实质内容/生成失败）")
                         continue
 
-                    # parent_tid 用 bot 自己的评论楼层序号：把接话挂在 bot 起的楼里，content 里 @对方
+                    # commentId 用 bot 自己的评论楼层序号：把接话挂在 bot 起的楼里；
+                    # commentUin/@token 指向被回复的那个人（replier_uin），二者是不同主体（别混）。
                     parent_tid = bot_tid or rep_tid
-                    ok = await api_client["reply"](fid, host_qq, replier_name, thread_reply, parent_tid)
+                    ok = await api_client["reply"](
+                        fid, host_qq, replier_name, thread_reply, parent_tid, replier_uin
+                    )
                     if ok:
                         self.comment_tracking.record_reply(fid, replier_uin)
                         replies_done += 1
@@ -2411,30 +2425,91 @@ class QZoneService:
                 logger.error(f"点赞说说异常: {e}")
                 return False
 
-        async def _reply(fid, host_qq, target_name, content, comment_tid):
-            """回复评论 - 修复为能正确提醒的回复格式"""
-            try:
-                # 修复回复逻辑：确保能正确提醒被回复的人
-                data = {
-                    "topicId": f"{host_qq}_{fid}__1",
-                    "parent_tid": comment_tid,
-                    "uin": uin,
-                    "hostUin": host_qq,
-                    "content": content,
-                    "format": "fs",
-                    "plat": "qzone",
-                    "source": "ic",
-                    "platformid": 52,
-                    "ref": "feeds",
-                    "richtype": "",
-                    "richval": "",
-                    "paramstr": "",
-                }
+        async def _reply(fid, host_qq, target_name, content, comment_tid, comment_uin=None, nested_comment_id=None):
+            """回复评论 - 修复为能正确提醒的回复格式。
 
-                # 记录详细的请求参数用于调试
-                logger.info(
-                    f"子回复请求参数: topicId={data['topicId']}, parent_tid={data['parent_tid']}, content='{content[:50]}...'"
-                )
+            :param comment_tid: off（平铺）路径下写入 ``parent_tid`` 的楼层序号 tid，原样字符串。
+            :param comment_uin: 被回复评论**作者**的 QQ（楼中楼路径必填）；
+                                None 时表示调用方未提供，将回退到平铺 parent_tid 逻辑。
+            :param nested_comment_id: 仅 nested-on 路径使用的 ``commentId``（顶层楼锚点 tid）。
+                                QZone 楼中楼只一层、parent 全归并到顶层，故 commentId 语义是「顶层楼的 tid」
+                                （见本文件 _detect_replies_to_own_comments 的 2026-07-09 真机实证注释）。
+                                子回复候选须传归并后的顶层 parent；缺省（None）时回退用 ``comment_tid``。
+                                与旧 parent_tid 语义**不同**，故独立入参，避免污染 off 路径。
+
+            两条互斥路径：
+            - ``monitor.use_nested_reply=True`` 且拿得到 comment_uin：走真正的楼中楼嵌套回复
+              （commentId + commentUin + 结构化 @token + feedsType/charset 等真机抓包字段）。
+            - 否则：完全回退旧的 ``parent_tid`` 平铺逻辑，行为零变化。
+            """
+            try:
+                # 开关 + 兜底：缺 comment_uin 时无法安全走嵌套（commentUin 传错会触发 -10049 反爬），强制回退。
+                use_nested = bool(self.get_config("monitor.use_nested_reply", False)) and bool(comment_uin)
+                # nested-on 的 commentId：优先用调用方给的顶层楼锚点，缺省回退 comment_tid。
+                nested_cid = nested_comment_id if nested_comment_id is not None else comment_tid
+
+                if use_nested:
+                    # --- 楼中楼真嵌套：拼结构化 @token，剥掉生成侧已有的 "@昵称 " 文本前缀避免双重@ ---
+                    # 生成侧（content_service）统一产出 "@{昵称} {正文}"；此处剥前缀取纯正文，再用
+                    # 结构化 token 重拼。token 后保留一个空格再接正文（真机抓包格式）。
+                    body = content or ""
+                    at_prefix = f"@{target_name} "
+                    # 只在精确匹配「@{昵称} 」前缀时剥（生成侧稳定产出此格式，覆盖正常态）。
+                    # 不用正则兜底剥前导 @：含空格昵称（QQ 允许，如「小 明」）会被 `^@\S+\s+` 误截正文；
+                    # startswith 失败属异常边缘态，宁可保留完整正文（最坏只是观感上双重@，绝不截断内容）。
+                    if body.startswith(at_prefix):
+                        body = body[len(at_prefix):]
+                    at_token = f"@{{uin:{comment_uin},nick:{target_name},auto:1}} {body}"
+                    data = {
+                        "topicId": f"{host_qq}_{fid}__1",
+                        "commentId": nested_cid,
+                        "commentUin": comment_uin,
+                        "uin": uin,
+                        "hostUin": host_qq,
+                        "content": at_token,
+                        "feedsType": 100,
+                        "inCharset": "utf-8",
+                        "outCharset": "utf-8",
+                        "format": "fs",
+                        "plat": "qzone",
+                        "source": "ic",
+                        "platformid": 52,
+                        "ref": "feeds",
+                        "richtype": "",
+                        "richval": "",
+                        "paramstr": "2",
+                        "private": "0",
+                        "qzreferrer": f"https://user.qzone.qq.com/{uin}/main",
+                    }
+                    # 脱敏日志（不含 g_tk/cookie）：确认参数正确 + 走了嵌套路
+                    logger.info(
+                        f"[楼中楼] 回复参数 nested=on commentId={nested_cid} "
+                        f"commentUin={comment_uin} topicId={data['topicId']} content='{at_token[:60]}...'"
+                    )
+                    # data 本身不含 g_tk/cookie（g_tk 仅在 query params，cookie 在请求头），可直接打
+                    logger.debug(f"[楼中楼] 回复完整data(脱敏): {data}")
+                else:
+                    # --- 回退：旧的平铺 parent_tid 逻辑，行为零变化 ---
+                    data = {
+                        "topicId": f"{host_qq}_{fid}__1",
+                        "parent_tid": comment_tid,
+                        "uin": uin,
+                        "hostUin": host_qq,
+                        "content": content,
+                        "format": "fs",
+                        "plat": "qzone",
+                        "source": "ic",
+                        "platformid": 52,
+                        "ref": "feeds",
+                        "richtype": "",
+                        "richval": "",
+                        "paramstr": "",
+                    }
+                    # 记录详细的请求参数用于调试
+                    logger.info(
+                        f"[楼中楼] 回复参数 nested=off parent_tid={data['parent_tid']} "
+                        f"topicId={data['topicId']} content='{content[:50]}...'"
+                    )
 
                 response_text = await _request("POST", self.REPLY_URL, params={"g_tk": gtk}, data=data)
 
@@ -2443,7 +2518,8 @@ class QZoneService:
                     response_data = orjson.loads(response_text)
                     code = response_data.get("code", -1)
                     if code == 0:
-                        logger.info(f"回复API返回成功: fid={fid}, parent_tid={comment_tid}")
+                        _cid_log = nested_cid if use_nested else comment_tid
+                        logger.info(f"回复API返回成功: fid={fid}, commentId={_cid_log}, nested={use_nested}")
                         return True
                     else:
                         message = response_data.get("message", "未知错误")
@@ -2454,7 +2530,10 @@ class QZoneService:
                     extracted = _extract_qzone_callback_json(response_text)
                     code = _pick_response_code(extracted) if extracted is not None else None
                     if code == 0:
-                        logger.info(f"回复API返回成功(HTML回调包 code=0): fid={fid}, parent_tid={comment_tid}")
+                        _cid_log = nested_cid if use_nested else comment_tid
+                        logger.info(
+                            f"回复API返回成功(HTML回调包 code=0): fid={fid}, commentId={_cid_log}, nested={use_nested}"
+                        )
                         return True
                     if code is not None:
                         message = extracted.get("message") or extracted.get("msg") or "未知错误"

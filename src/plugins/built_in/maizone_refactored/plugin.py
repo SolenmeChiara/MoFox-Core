@@ -86,6 +86,13 @@ class MaiZoneRefactoredPlugin(BasePlugin):
             "enable_auto_monitor": ConfigField(type=bool, default=False, description="是否启用自动监控"),
             "interval_minutes": ConfigField(type=int, default=10, description="监控间隔分钟数"),
             "enable_auto_reply": ConfigField(type=bool, default=False, description="是否启用自动回复自己说说的评论"),
+            "use_nested_reply": ConfigField(
+                type=bool,
+                default=False,
+                description="是否使用「楼中楼真嵌套」回复（commentId+commentUin+结构化@token+feedsType）。"
+                "默认关闭（走旧的 parent_tid 平铺回复，行为零变化）；开启前请先 dry-run 验证参数、"
+                "确认 commentUin 取的是被回复者而非 bot，避免 -10049 反爬。",
+            ),
             "enable_own_thread_reply": ConfigField(
                 type=bool,
                 default=True,
