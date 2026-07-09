@@ -796,6 +796,66 @@ class QZoneService:
     # --- 自己说说「自楼接话」（修 msglist 楼中楼盲区）---
 
     @staticmethod
+    def _compute_thread_signal(feed: dict) -> int:
+        """计算对楼中楼敏感的「复合信号」，用于替换只认 cmtnum 的便宜信号闸。
+
+        背景：实测 QZone 的 msglist ``cmtnum``（顶层评论计数）**不随楼中楼增长**，导致「别人在
+        bot 评论下新增楼中楼」时旧闸门判定「无变化」而从不拉 msgdetail、检测逻辑收不到数据。
+
+        公式：``signal = cmtnum + Σ(每条顶层评论的 reply_num)``。
+        - ``reply_num`` 缺失/为 0 时，用该楼在 msglist 里**实际解析到的 is_sub 子回复数**兜底
+          （``parent_tid`` 指向该顶层评论 tid 的子回复计数）。
+        - 顶层评论全都取不到 reply_num 且无解析到的子回复时，Σ 自然为 0 → 退化为纯 cmtnum
+          （保底不比现状差）。
+
+        防御性：所有字段多候选取值 + 判空，非 int（含 bool）一律当 0。传入非 dict 返回 0。
+        """
+        if not isinstance(feed, dict):
+            return 0
+
+        comments = feed.get("comments", [])
+        if not isinstance(comments, list):
+            comments = []
+
+        # cmtnum：优先 msglist 原生计数字段，多候选；拿不到用实际解析到的顶层评论条数兜底
+        cmtnum = 0
+        for k in ("cmtnum", "commentcount", "comment_num", "commentNum"):
+            v = feed.get(k)
+            if isinstance(v, bool):
+                continue
+            if isinstance(v, (int, float)):
+                cmtnum = int(v)
+                break
+            if isinstance(v, str) and v.isdigit():
+                cmtnum = int(v)
+                break
+        if cmtnum <= 0:
+            cmtnum = sum(1 for c in comments if isinstance(c, dict) and not c.get("is_sub"))
+
+        # parent_tid -> 实际解析到的 is_sub 子回复数（reply_num 缺失时的兜底）
+        sub_count_by_parent: dict[str, int] = {}
+        for c in comments:
+            if isinstance(c, dict) and c.get("is_sub"):
+                p = c.get("parent_tid")
+                if p is not None:
+                    key = str(p)
+                    sub_count_by_parent[key] = sub_count_by_parent.get(key, 0) + 1
+
+        reply_sum = 0
+        for c in comments:
+            if not isinstance(c, dict) or c.get("is_sub"):
+                continue
+            rn_raw = c.get("reply_num")
+            rn = int(rn_raw) if isinstance(rn_raw, int) and not isinstance(rn_raw, bool) else 0
+            if rn <= 0:
+                # reply_num 缺失/为 0：用实际解析到的子回复数兜底
+                tid = c.get("comment_tid")
+                rn = sub_count_by_parent.get(str(tid), 0) if tid is not None else 0
+            reply_sum += rn
+
+        return cmtnum + reply_sum
+
+    @staticmethod
     def _detect_replies_to_own_comments(
         comments: list[dict],
         bot_qq: str,
@@ -807,9 +867,12 @@ class QZoneService:
         """在「自己说说」的完整评论楼里，双路检测「冲着 bot 来的回复」（按时间升序，先接早的）。
 
         改造自 ``_detect_replies_to_bot``（好友接话闭环）。语义差异：那里 bot 是评论者、只有唯一
-        一条顶层评论作为「bot 的楼」；这里 bot 是楼主，bot 对不同评论者的回复实测落地为**多条平铺
-        level-2 顶层评论**（``_reply`` → t2_subtype=1、content="@昵称 正文"、不进 list_3），故 bot 的
-        「楼」是一个**集合** ``bot_tids``（所有 uin==bot 的顶层评论 tid）。
+        一条顶层评论作为「bot 的楼」；这里 bot 是楼主，bot 的「楼」是一个**集合** ``bot_tids``。
+
+        ⚠️ 渲染形态两兼容：bot 的 auto_reply 由 ``_reply`` 带 ``parent_tid`` 发出，QZone 的落地形态
+        离线无法确证——可能是**平铺 level-2 顶层评论**（t2_subtype=1、content="@昵称 正文"、不进
+        list_3），也可能被渲染进 ``list_3`` 成**楼中楼子回复**（is_sub=True）。因此调用方把 uin==bot
+        的**全部**评论 tid（不分 is_sub）都收进 ``bot_tids``，两种形态都能作为锚点被命中。
 
         路 (a) 楼中楼：``list_3`` 里 ``parent_tid`` 落在 ``bot_tids`` 中的子回复（别人回复 bot 的评论）。
                  时间门：晚于该 bot 楼（``bot_tid_ts[parent]``）的活动时间才算新。
@@ -881,6 +944,11 @@ class QZoneService:
         max_per_round = int(self.get_config("monitor.own_thread_max_replies_per_round", 3))
         per_feed_limit = int(self.get_config("monitor.own_thread_per_feed_limit", 2))
         ttl_hours = float(self.get_config("monitor.own_thread_tracking_ttl_hours", 168))
+        # 兜底强刷阈值（分钟，0=关闭）：即使复合信号也失灵，也保证有 bot 评论的 feed 最迟这么久被拉一次
+        try:
+            force_refresh_minutes = int(self.get_config("monitor.own_thread_force_refresh_minutes", 180))
+        except (TypeError, ValueError):
+            force_refresh_minutes = 180
 
         # 先清理过期追踪，控制存储无界增长
         try:
@@ -902,23 +970,50 @@ class QZoneService:
             if not fid:
                 continue
 
-            # 便宜信号：msglist 返回的评论总数（cmtnum 多候选，兜底用已解析评论条数）
+            # 复合信号：对楼中楼敏感（cmtnum+Σreply_num，缺失时兜底 is_sub 子回复数）。
+            # 存储沿用 last_cmtnum 字段名（语义已改为「上次信号值」，不迁移旧数据）。
+            signal = self._compute_thread_signal(feed)
+            # 顶层评论数（仅用于「无评论则跳过、不空拉 msgdetail」的判断，与信号闸解耦）
+            comments_snapshot = feed.get("comments", []) or []
             raw_cmtnum = feed.get("cmtnum")
-            cmtnum = raw_cmtnum if isinstance(raw_cmtnum, int) else len(feed.get("comments", []) or [])
+            if isinstance(raw_cmtnum, int) and not isinstance(raw_cmtnum, bool):
+                cmtnum = raw_cmtnum
+            else:
+                cmtnum = sum(1 for c in comments_snapshot if isinstance(c, dict) and not c.get("is_sub"))
 
             needs_baseline = self.own_thread_tracking.needs_baseline(fid)
-            last_cmtnum = self.own_thread_tracking.get_last_cmtnum(fid)
-            changed = last_cmtnum is None or cmtnum != last_cmtnum
-            # 闸门：既不需要基线、评论数也没变 → 不拉 msgdetail
-            if not needs_baseline and not changed:
+            last_signal = self.own_thread_tracking.get_last_cmtnum(fid)
+            changed = last_signal is None or signal != last_signal
+
+            # 兜底强刷（安全网，防复合信号也不可靠）：msglist 快照里存在 uin==bot 的评论、
+            # 且距上次为它拉 msgdetail 超过阈值 → 无视信号强制拉一次。
+            force_refresh = False
+            if force_refresh_minutes > 0 and not needs_baseline and not changed:
+                has_bot_cmt = any(
+                    isinstance(c, dict) and str(c.get("qq_account", "") or "") == qq_account
+                    for c in comments_snapshot
+                )
+                if has_bot_cmt:
+                    last_detail_ts = self.own_thread_tracking.get_last_detail_ts(fid)
+                    if last_detail_ts is None or (time.time() - last_detail_ts) >= force_refresh_minutes * 60:
+                        force_refresh = True
+
+            # 闸门：不需要基线、信号也没变、也没触发强刷 → 不拉 msgdetail
+            if not needs_baseline and not changed and not force_refresh:
                 continue
+
+            # 可 grep 验证是哪条路触发的拉取
+            if changed and not needs_baseline:
+                logger.debug(f"[自楼接话] 信号变化 fid={fid} 旧{last_signal}→新{signal}")
+            if force_refresh:
+                logger.info(f"[自楼接话] 兜底强刷 fid={fid}")
 
             # 无评论：无候选，记账后跳过（避免空拉 msgdetail）
             if cmtnum <= 0:
                 if needs_baseline:
-                    self.own_thread_tracking.seed_baseline(fid, 0, [])
+                    self.own_thread_tracking.seed_baseline(fid, signal, [])
                 else:
-                    self.own_thread_tracking.update_cmtnum(fid, 0)
+                    self.own_thread_tracking.update_cmtnum(fid, signal)
                 continue
 
             try:
@@ -926,22 +1021,28 @@ class QZoneService:
                 await asyncio.sleep(random.uniform(2, 4))
                 detail = await api_client["get_feed_detail"](qq_account, fid)
                 msgdetail_calls += 1
+                # 记录本轮实际拉过详情的时间（兜底强刷节流依据）
+                self.own_thread_tracking.mark_detail_fetched(fid)
             except Exception as e:
                 logger.error(f"[自楼接话] 拉取说说详情异常(fid={fid}): {e}")
                 continue
             if not detail:
-                # 拿不到详情：保留状态不更新 cmtnum，下轮重试
+                # 拿不到详情：保留状态不更新信号，下轮重试
                 continue
 
             comments = detail.get("comments", []) or []
             if not comments:
                 if needs_baseline:
-                    self.own_thread_tracking.seed_baseline(fid, cmtnum, [])
+                    self.own_thread_tracking.seed_baseline(fid, signal, [])
                 else:
-                    self.own_thread_tracking.update_cmtnum(fid, cmtnum)
+                    self.own_thread_tracking.update_cmtnum(fid, signal)
                 continue
 
-            # 定位 bot 的所有「楼」：uin==bot 的顶层评论（平铺 level-2 也算顶层，非 is_sub）
+            # 定位 bot 的所有「楼」：uin==bot 的**全部**评论 tid（不分 is_sub）。
+            # 锚点加固：bot 的 auto_reply 落地形态离线无法确证（平铺 level-2 顶层 或 list_3 楼中楼），
+            # 两种形态的 tid 都收进 bot_tids，路 (a) 才能命中「别人回复 bot 评论」的子回复；
+            # 逐楼时间戳 bot_tid_ts 同步涵盖 is_sub 的 bot 评论。语义不变：只接冲着 bot 来的
+            # （parent 指向非 bot 楼的两好友互聊仍不命中）。
             bot_tids: set[str] = set()
             bot_tid_ts: dict[str, int] = {}
             bot_last_ts = 0
@@ -954,7 +1055,7 @@ class QZoneService:
                     bot_last_ts = c_ts
                 if not bot_name and c.get("nickname"):
                     bot_name = str(c.get("nickname"))
-                if not c.get("is_sub") and c.get("comment_tid") is not None:
+                if c.get("comment_tid") is not None:
                     tid = str(c.get("comment_tid"))
                     bot_tids.add(tid)
                     bot_tid_ts[tid] = c_ts
@@ -972,7 +1073,7 @@ class QZoneService:
             # 首轮：基线播种——把现存候选全部记为已见、不回复
             if needs_baseline:
                 keys = [f"{c.get('qq_account')}_{c.get('comment_tid')}" for c in candidates]
-                self.own_thread_tracking.seed_baseline(fid, cmtnum, keys)
+                self.own_thread_tracking.seed_baseline(fid, signal, keys)
                 baseline_total += len(keys)
                 logger.info(f"[自楼接话] 基线播种 {len(keys)} 条（fid={fid}，不回复历史）")
                 continue
@@ -1058,10 +1159,10 @@ class QZoneService:
                 else:
                     logger.warning(f"[自楼接话] 回复 {replier_name} 失败(fid={fid})")
 
-            # 只有完整扫完该 feed（未因全局上限中断）才推进 cmtnum 基线；
+            # 只有完整扫完该 feed（未因全局上限中断）才推进信号基线；
             # 否则留旧值，下轮重开闸门继续处理剩余候选。
             if not capped:
-                self.own_thread_tracking.update_cmtnum(fid, cmtnum)
+                self.own_thread_tracking.update_cmtnum(fid, signal)
 
         logger.info(
             f"[自楼接话] 本轮完成：基线播种 {baseline_total} 条 / 发现候选 {candidates_total} 条 / "

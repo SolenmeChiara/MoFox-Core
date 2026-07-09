@@ -10,7 +10,9 @@
 
     {
       "<feed_id>": {
-        "last_cmtnum": int,           # 上次记录的评论总数（便宜信号闸：变化才拉 msgdetail）
+        "last_cmtnum": int,           # 上次记录的「复合信号值」（cmtnum+Σreply_num，对楼中楼敏感；
+                                      #   变化才拉 msgdetail。沿用旧字段名、不迁移旧数据）
+        "last_detail_ts": float,      # 上次为本 feed 拉 msgdetail 的时间戳（兜底强刷判断依据）
         "baseline_seeded": bool,      # 是否已完成基线播种（首轮把现存候选全部标记已见、不回复）
         "seen_reply_keys": [str],     # 已处理过的回复去重 key（"<uin>_<tid>"）
         "replied_uins": [str],        # 本 feed 内 bot 已接过话的人（同一个人只接一次，防对喷循环）
@@ -66,6 +68,7 @@ class OwnThreadTrackingService:
         if entry is None:
             entry = {
                 "last_cmtnum": -1,
+                "last_detail_ts": 0.0,
                 "baseline_seeded": False,
                 "seen_reply_keys": [],
                 "replied_uins": [],
@@ -87,15 +90,18 @@ class OwnThreadTrackingService:
         return entry is None or not entry.get("baseline_seeded", False)
 
     def get_last_cmtnum(self, feed_id: Any) -> int | None:
-        """上次记录的评论总数；无记录返回 None。"""
+        """上次记录的「复合信号值」（字段名沿用 last_cmtnum，语义已改为信号值）；无记录返回 None。"""
         entry = self._entry(feed_id)
         if entry is None:
             return None
         v = entry.get("last_cmtnum", -1)
         return v if isinstance(v, int) else None
 
-    def seed_baseline(self, feed_id: Any, cmtnum: int, seen_keys: list[str]) -> None:
-        """基线播种：把现存候选的 key 全部记为已见（不回复），并记录评论总数。"""
+    def seed_baseline(self, feed_id: Any, signal: int, seen_keys: list[str]) -> None:
+        """基线播种：把现存候选的 key 全部记为已见（不回复），并记录复合信号值。
+
+        ``signal`` 为对楼中楼敏感的复合信号（cmtnum+Σreply_num），存入沿用的 last_cmtnum 字段。
+        """
         try:
             entry = self._ensure(feed_id)
             keys = entry.setdefault("seen_reply_keys", [])
@@ -108,20 +114,40 @@ class OwnThreadTrackingService:
             if len(keys) > _MAX_SEEN_KEYS:
                 del keys[:-_MAX_SEEN_KEYS]
             entry["baseline_seeded"] = True
-            entry["last_cmtnum"] = int(cmtnum) if isinstance(cmtnum, int) else -1
+            entry["last_cmtnum"] = int(signal) if isinstance(signal, int) else -1
             entry["updated_at"] = time.time()
             self._persist()
         except Exception as e:
             logger.warning(f"[自楼接话] 基线播种失败(fid={feed_id}): {e}")
 
-    def update_cmtnum(self, feed_id: Any, cmtnum: int) -> None:
-        """记录本轮观察到的评论总数，作为下次便宜信号闸的比较基准。"""
+    def update_cmtnum(self, feed_id: Any, signal: int) -> None:
+        """记录本轮观察到的复合信号值，作为下次便宜信号闸的比较基准（字段名沿用 last_cmtnum）。"""
         entry = self._entry(feed_id)
         if entry is None:
             return
-        entry["last_cmtnum"] = int(cmtnum) if isinstance(cmtnum, int) else -1
+        entry["last_cmtnum"] = int(signal) if isinstance(signal, int) else -1
         entry["updated_at"] = time.time()
         self._persist()
+
+    # ---------------- 兜底强刷（防复合信号也失灵）----------------
+
+    def get_last_detail_ts(self, feed_id: Any) -> float | None:
+        """上次为本 feed 拉 msgdetail 的时间戳；无记录返回 None（兜底强刷判断用）。"""
+        entry = self._entry(feed_id)
+        if entry is None:
+            return None
+        v = entry.get("last_detail_ts", 0.0)
+        return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+    def mark_detail_fetched(self, feed_id: Any) -> None:
+        """记录本轮实际为本 feed 拉过一次 msgdetail（用于兜底强刷的节流，避免每轮硬刷）。"""
+        try:
+            entry = self._ensure(feed_id)
+            entry["last_detail_ts"] = time.time()
+            entry["updated_at"] = time.time()
+            self._persist()
+        except Exception as e:
+            logger.warning(f"[自楼接话] 记录拉详情时间失败(fid={feed_id}): {e}")
 
     # ---------------- 去重 / 防刷楼 ----------------
 

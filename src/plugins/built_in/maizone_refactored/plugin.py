@@ -101,6 +101,13 @@ class MaiZoneRefactoredPlugin(BasePlugin):
             "own_thread_tracking_ttl_hours": ConfigField(
                 type=int, default=168, description="一条自己说说追踪多久（小时），超时不再轮询其楼中楼回复"
             ),
+            "own_thread_force_refresh_minutes": ConfigField(
+                type=int,
+                default=180,
+                description="自楼接话「兜底强刷」阈值（分钟，0=关闭）：即使复合信号失灵，只要 msglist 快照里"
+                "有 bot 自己的评论、且距上次拉详情超过此分钟数，就强制拉一次 msgdetail，"
+                "保证楼中楼最迟这么久内被发现（最坏成本=bot 评论过的自己说说数 ≤5 每此周期各 1 次）",
+            ),
         },
         "schedule": {
             "enable_schedule": ConfigField(type=bool, default=False, description="是否启用定时发送"),
