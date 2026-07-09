@@ -250,7 +250,12 @@ class MoodRegressionTask(AsyncTask):
                     continue
 
                 logger.debug(f"{mood.log_prefix} 开始情绪回归, 第 {mood.regression_count + 1} 次")
-                await mood.regress_mood()
+                try:
+                    await mood.regress_mood()
+                except Exception as e:
+                    # 单个聊天流回归失败（模型拒答/过载等）不能让异常穿透到 async_task_manager，
+                    # 否则整个后台任务被移除，情绪回归直到重启前都不再运行
+                    logger.warning(f"{mood.log_prefix} 情绪回归失败，跳过本轮: {e}")
 
 
 class MoodManager:
