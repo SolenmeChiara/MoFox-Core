@@ -2448,6 +2448,55 @@ class QZoneService:
                 # nested-on 的 commentId：优先用调用方给的顶层楼锚点，缺省回退 comment_tid。
                 nested_cid = nested_comment_id if nested_comment_id is not None else comment_tid
 
+                # --- 楼中楼实验常量（实验性，出结论后移除或转正）---
+                # 仅作用于「nested=on 且 host_qq != uin（好友空间）」路径，用于鉴别好友说说下固定
+                # 返回 -10049 的成因：假设A=突发限流（等一等重发即通）；假设B=qzreferrer 校验
+                # （硬编码 bot 主页 referrer 与 hostUin 不符被反爬拒）。自楼与平铺路径均不受影响。
+                _EXP_BUSY_CODE = -10049  # 服务端「使用人数过多，请稍后再试」业务码
+                _EXP_PRE_SLEEP = (15.0, 30.0)  # 首发前呼吸区间（秒）：模拟真人读→回，并与详情拉取风暴解耦
+                _EXP_RETRY_SLEEP = (90.0, 150.0)  # 每次 -10049 后的重试等待区间（秒）
+                _EXP_MAX_ATTEMPTS = 3  # 最大尝试数：baseline / retry-after-wait / host-referrer
+
+                async def _post_reply(data):
+                    """发送回复 payload 并解析业务码，供三条路径共用。
+
+                    返回 ``(ret, code)``：``ret`` 为非实验路径下 ``_reply`` 的原始返回值
+                    （成功/假定成功 True，失败 False）；``code`` 为解析出的业务码 int，
+                    无法确定时为 None。内部日志、分支与返回值与旧实现逐字节一致。
+                    """
+                    response_text = await _request("POST", self.REPLY_URL, params={"g_tk": gtk}, data=data)
+
+                    # 解析响应检查业务状态
+                    try:
+                        response_data = orjson.loads(response_text)
+                        code = response_data.get("code", -1)
+                        if code == 0:
+                            _cid_log = nested_cid if use_nested else comment_tid
+                            logger.info(f"回复API返回成功: fid={fid}, commentId={_cid_log}, nested={use_nested}")
+                            return True, code
+                        else:
+                            message = response_data.get("message", "未知错误")
+                            logger.error(f"回复API返回失败: code={code}, message={message}, fid={fid}")
+                            return False, code
+                    except orjson.JSONDecodeError:
+                        # 与 _comment 一致：re_feeds 返回 HTML 嵌回调，尝试抠 code；抠不到维持「假定成功」。
+                        extracted = _extract_qzone_callback_json(response_text)
+                        code = _pick_response_code(extracted) if extracted is not None else None
+                        if code == 0:
+                            _cid_log = nested_cid if use_nested else comment_tid
+                            logger.info(
+                                f"回复API返回成功(HTML回调包 code=0): fid={fid}, commentId={_cid_log}, nested={use_nested}"
+                            )
+                            return True, code
+                        if code is not None:
+                            message = extracted.get("message") or extracted.get("msg") or "未知错误"
+                            logger.warning(f"回复API返回失败(HTML回调包 code={code}): message={message}, fid={fid}")
+                            return False, code
+                        logger.warning(
+                            f"回复API响应非JSON且未能提取回调code，维持假定成功: {_sanitize_resp_snippet(response_text)}"
+                        )
+                        return True, None
+
                 if use_nested:
                     # --- 楼中楼真嵌套：拼结构化 @token，剥掉生成侧已有的 "@昵称 " 文本前缀避免双重@ ---
                     # 生成侧（content_service）统一产出 "@{昵称} {正文}"；此处剥前缀取纯正文，再用
@@ -2460,27 +2509,93 @@ class QZoneService:
                     if body.startswith(at_prefix):
                         body = body[len(at_prefix):]
                     at_token = f"@{{uin:{comment_uin},nick:{target_name},auto:1}} {body}"
-                    data = {
-                        "topicId": f"{host_qq}_{fid}__1",
-                        "commentId": nested_cid,
-                        "commentUin": comment_uin,
-                        "uin": uin,
-                        "hostUin": host_qq,
-                        "content": at_token,
-                        "feedsType": 100,
-                        "inCharset": "utf-8",
-                        "outCharset": "utf-8",
-                        "format": "fs",
-                        "plat": "qzone",
-                        "source": "ic",
-                        "platformid": 52,
-                        "ref": "feeds",
-                        "richtype": "",
-                        "richval": "",
-                        "paramstr": "2",
-                        "private": "0",
-                        "qzreferrer": f"https://user.qzone.qq.com/{uin}/main",
-                    }
+
+                    def _build_nested_data(qzreferrer):
+                        """构造嵌套回复 payload；仅 qzreferrer 可变，其余字段与真机抓包一致。"""
+                        return {
+                            "topicId": f"{host_qq}_{fid}__1",
+                            "commentId": nested_cid,
+                            "commentUin": comment_uin,
+                            "uin": uin,
+                            "hostUin": host_qq,
+                            "content": at_token,
+                            "feedsType": 100,
+                            "inCharset": "utf-8",
+                            "outCharset": "utf-8",
+                            "format": "fs",
+                            "plat": "qzone",
+                            "source": "ic",
+                            "platformid": 52,
+                            "ref": "feeds",
+                            "richtype": "",
+                            "richval": "",
+                            "paramstr": "2",
+                            "private": "0",
+                            "qzreferrer": qzreferrer,
+                        }
+
+                    if str(host_qq) != str(uin):
+                        # === 楼中楼实验（好友空间 host_qq != uin）===
+                        # 三级阶梯：仅当业务码恰为 -10049 才进下一级；其它码（含成功/假定成功）维持现状直接返回。
+                        default_referrer = f"https://user.qzone.qq.com/{uin}/main"
+                        # 与 default_referrer 只差 uin→host_qq 一个变量（保留 /main），保证变体3归因纯净
+                        host_referrer = f"https://user.qzone.qq.com/{host_qq}/main"
+                        # (变体名, qzreferrer, 该次尝试前的等待区间；None 表示不等)
+                        variants = [
+                            ("baseline", default_referrer, None),
+                            ("retry-after-wait", default_referrer, _EXP_RETRY_SLEEP),
+                            ("host-referrer", host_referrer, _EXP_RETRY_SLEEP),
+                        ]
+                        _hyp_of = {
+                            "baseline": "基线首发即成功（既非A也非B，可能偶发）",
+                            "retry-after-wait": "假设A（突发限流）成立",
+                            "host-referrer": "假设B（referrer校验）成立",
+                        }
+
+                        # 首发前呼吸：模拟真人从读到回的间隔，同时与前面的详情拉取请求风暴解耦。
+                        pre_sleep = random.uniform(*_EXP_PRE_SLEEP)
+                        logger.info(f"[楼中楼实验] 好友空间 host={host_qq} 首发前呼吸 {pre_sleep:.0f}s")
+                        await asyncio.sleep(pre_sleep)
+
+                        last_ret = False
+                        for idx, (variant, referrer, retry_sleep) in enumerate(variants, start=1):
+                            waited = 0.0
+                            if retry_sleep is not None:
+                                waited = random.uniform(*retry_sleep)
+                                await asyncio.sleep(waited)
+                            data = _build_nested_data(referrer)
+                            # 首轮打全量参数便于核对；后续仅打变体差异（qzreferrer）便于对比排障。
+                            if idx == 1:
+                                logger.info(
+                                    f"[楼中楼] 回复参数 nested=on commentId={nested_cid} "
+                                    f"commentUin={comment_uin} topicId={data['topicId']} content='{at_token[:60]}...'"
+                                )
+                                logger.debug(f"[楼中楼] 回复完整data(脱敏): {data}")
+                            else:
+                                logger.info(f"[楼中楼] 回复参数(重试 variant={variant}) qzreferrer={referrer}")
+                            ret, code = await _post_reply(data)
+                            logger.info(
+                                f"[楼中楼实验] 尝试{idx}/{_EXP_MAX_ATTEMPTS} variant={variant} "
+                                f"等待{waited:.0f}s后{'发送' if idx == 1 else '重发'} → code={code}"
+                            )
+                            last_ret = ret
+                            if code == 0:
+                                logger.info(f"[楼中楼实验] ★ variant={variant} 成功，{_hyp_of.get(variant, variant)}")
+                                return True
+                            if code != _EXP_BUSY_CODE:
+                                # 非 -10049 的其它结果（失败码 / 假定成功）：维持现状，不再重试。
+                                logger.info(
+                                    f"[楼中楼实验] variant={variant} 返回非限流码 code={code}，停止实验（维持现状）"
+                                )
+                                return ret
+                            # code == -10049 → 继续下一级（若已是末级，循环结束后返回 last_ret）
+                        logger.info(
+                            f"[楼中楼实验] 三级阶梯均为 {_EXP_BUSY_CODE}，假设A/B 均未验证成立（或限流持续），放弃"
+                        )
+                        return last_ret
+
+                    # --- 自楼（host_qq == uin）：零改动，沿用 bot 主页 referrer ---
+                    data = _build_nested_data(f"https://user.qzone.qq.com/{uin}/main")
                     # 脱敏日志（不含 g_tk/cookie）：确认参数正确 + 走了嵌套路
                     logger.info(
                         f"[楼中楼] 回复参数 nested=on commentId={nested_cid} "
@@ -2488,61 +2603,32 @@ class QZoneService:
                     )
                     # data 本身不含 g_tk/cookie（g_tk 仅在 query params，cookie 在请求头），可直接打
                     logger.debug(f"[楼中楼] 回复完整data(脱敏): {data}")
-                else:
-                    # --- 回退：旧的平铺 parent_tid 逻辑，行为零变化 ---
-                    data = {
-                        "topicId": f"{host_qq}_{fid}__1",
-                        "parent_tid": comment_tid,
-                        "uin": uin,
-                        "hostUin": host_qq,
-                        "content": content,
-                        "format": "fs",
-                        "plat": "qzone",
-                        "source": "ic",
-                        "platformid": 52,
-                        "ref": "feeds",
-                        "richtype": "",
-                        "richval": "",
-                        "paramstr": "",
-                    }
-                    # 记录详细的请求参数用于调试
-                    logger.info(
-                        f"[楼中楼] 回复参数 nested=off parent_tid={data['parent_tid']} "
-                        f"topicId={data['topicId']} content='{content[:50]}...'"
-                    )
+                    ret, _code = await _post_reply(data)
+                    return ret
 
-                response_text = await _request("POST", self.REPLY_URL, params={"g_tk": gtk}, data=data)
-
-                # 解析响应检查业务状态
-                try:
-                    response_data = orjson.loads(response_text)
-                    code = response_data.get("code", -1)
-                    if code == 0:
-                        _cid_log = nested_cid if use_nested else comment_tid
-                        logger.info(f"回复API返回成功: fid={fid}, commentId={_cid_log}, nested={use_nested}")
-                        return True
-                    else:
-                        message = response_data.get("message", "未知错误")
-                        logger.error(f"回复API返回失败: code={code}, message={message}, fid={fid}")
-                        return False
-                except orjson.JSONDecodeError:
-                    # 与 _comment 一致：re_feeds 返回 HTML 嵌回调，尝试抠 code；抠不到维持「假定成功」。
-                    extracted = _extract_qzone_callback_json(response_text)
-                    code = _pick_response_code(extracted) if extracted is not None else None
-                    if code == 0:
-                        _cid_log = nested_cid if use_nested else comment_tid
-                        logger.info(
-                            f"回复API返回成功(HTML回调包 code=0): fid={fid}, commentId={_cid_log}, nested={use_nested}"
-                        )
-                        return True
-                    if code is not None:
-                        message = extracted.get("message") or extracted.get("msg") or "未知错误"
-                        logger.warning(f"回复API返回失败(HTML回调包 code={code}): message={message}, fid={fid}")
-                        return False
-                    logger.warning(
-                        f"回复API响应非JSON且未能提取回调code，维持假定成功: {_sanitize_resp_snippet(response_text)}"
-                    )
-                    return True
+                # --- 回退：旧的平铺 parent_tid 逻辑，行为零变化 ---
+                data = {
+                    "topicId": f"{host_qq}_{fid}__1",
+                    "parent_tid": comment_tid,
+                    "uin": uin,
+                    "hostUin": host_qq,
+                    "content": content,
+                    "format": "fs",
+                    "plat": "qzone",
+                    "source": "ic",
+                    "platformid": 52,
+                    "ref": "feeds",
+                    "richtype": "",
+                    "richval": "",
+                    "paramstr": "",
+                }
+                # 记录详细的请求参数用于调试
+                logger.info(
+                    f"[楼中楼] 回复参数 nested=off parent_tid={data['parent_tid']} "
+                    f"topicId={data['topicId']} content='{content[:50]}...'"
+                )
+                ret, _code = await _post_reply(data)
+                return ret
             except Exception as e:
                 logger.error(f"回复评论异常: {e}")
                 return False
