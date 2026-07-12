@@ -304,15 +304,45 @@ class KFCReplyAction(BaseAction):
             )
 
     def _capture_interrupt_baseline(self) -> None:
-        """记录本轮生成开始时的打断基线。
+        """记录本轮生成开始时的打断基线（时间戳 + 已知消息ID集合）。
 
         基线包含：
-        - _interrupt_baseline_time: execute() 起始时间戳
-        - _interrupt_baseline_ids: 起始时已知的所有消息ID（未读 + 缓存）
+        - _interrupt_baseline_time: 基线时间戳
+        - _interrupt_baseline_ids: 基线时刻已知的所有消息ID（未读 ∪ 缓存）
+
+        优先消费 chatter 通过 action_data 传入的"回合快照基线"——它捕获于 chatter 取未读
+        消息的那一刻（planner LLM 之前），能覆盖 planner ~15s 窗口内到达的消息，修复
+        "planner 期间到达的消息被并入缓存后漏判打断"的时序盲区。
+
+        拿不到回合基线时（proactive 直调动作等独立场景）回退为动作自采：以 execute() 起始
+        为基线时间、采集当时未读 ∪ 缓存的消息ID。此时基线通常为空，语义仍正确——proactive
+        无触发消息，任何生成期间到达的新用户消息都会触发打断（保持昨晚已实现的语义）。
 
         用于 _should_interrupt 区分"本轮触发时就已存在的消息"和"生成期间新到的消息"，
         避免把本轮的触发消息误判为打断信号。失败时降级为仅时间基线，不阻断主流程。
         """
+        # 优先：消费 chatter 传入的回合快照基线
+        action_data = self.action_data if isinstance(self.action_data, dict) else {}
+        round_time = action_data.get("_interrupt_baseline_time")
+        round_ids = action_data.get("_interrupt_baseline_ids")
+        if round_time is not None and round_ids is not None:
+            try:
+                self._interrupt_baseline_time = float(round_time)
+            except (TypeError, ValueError):
+                self._interrupt_baseline_time = time.time()
+            self._interrupt_baseline_ids = set(round_ids)
+            # 消费后从 action_data 移除：_interrupt_baseline_ids 为 set，非 JSON 安全，
+            # 若残留会在 _store_action_info 的 reply_text 为空分支被 orjson.dumps 拒绝（虽被
+            # try/except 兜住但会丢失动作记录）。就地清理使动作存档彻底不含内部基线字段。
+            action_data.pop("_interrupt_baseline_time", None)
+            action_data.pop("_interrupt_baseline_ids", None)
+            logger.debug(
+                f"{self.log_prefix} 打断基线已捕获(来源=回合快照): 已知消息 "
+                f"{len(self._interrupt_baseline_ids)} 条, baseline_time={self._interrupt_baseline_time:.3f}"
+            )
+            return
+
+        # 回退：动作自采（proactive 直调等独立场景）
         self._interrupt_baseline_time = time.time()
         ids: set[str] = set()
         try:
@@ -333,7 +363,7 @@ class KFCReplyAction(BaseAction):
             logger.debug(f"{self.log_prefix} 捕获打断基线失败: {e}")
         self._interrupt_baseline_ids = ids
         logger.debug(
-            f"{self.log_prefix} 打断基线已捕获: 已知消息 {len(ids)} 条, "
+            f"{self.log_prefix} 打断基线已捕获(来源=动作自采): 已知消息 {len(ids)} 条, "
             f"baseline_time={self._interrupt_baseline_time:.3f}"
         )
 

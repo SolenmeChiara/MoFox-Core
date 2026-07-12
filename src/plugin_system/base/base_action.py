@@ -185,15 +185,19 @@ class BaseAction(ABC):
         if self.has_action_message:
             if self.action_name != "no_reply":
                 # 统一处理 DatabaseMessages 对象和字典
+                # 注意：id 类字段统一经 _normalize_id 归一，避免 str(None) == "None"
+                # 这类真值字符串毒化群聊/私聊判定（私聊 group_id 为空却被误判为群聊）。
                 if isinstance(self.action_message, DatabaseMessages):
-                    self.group_id = str(self.action_message.group_info.group_id if self.action_message.group_info else None)
-                    self.group_name = self.action_message.group_info.group_name if self.action_message.group_info else None
-                    self.user_id = str(self.action_message.user_info.user_id)
-                    self.user_nickname = self.action_message.user_info.user_nickname
+                    group_info = self.action_message.group_info
+                    self.group_id = self._normalize_id(group_info.group_id) if group_info else None
+                    self.group_name = group_info.group_name if group_info else None
+                    user_info = self.action_message.user_info
+                    self.user_id = self._normalize_id(user_info.user_id) if user_info else None
+                    self.user_nickname = user_info.user_nickname if user_info else None
                 else:
-                    self.group_id = str(self.action_message.get("chat_info_group_id", None))
+                    self.group_id = self._normalize_id(self.action_message.get("chat_info_group_id"))
                     self.group_name = self.action_message.get("chat_info_group_name", None)
-                    self.user_id = str(self.action_message.get("user_id", None))
+                    self.user_id = self._normalize_id(self.action_message.get("user_id"))
                     self.user_nickname = self.action_message.get("user_nickname", None)
 
                 if self.group_id:
@@ -225,6 +229,24 @@ class BaseAction(ABC):
                 f"{self.log_prefix} Action '{self.action_name}' 不支持当前聊天类型: "
                 f"{'群聊' if self.is_group else '私聊'}, 允许类型: {self.chat_type_allow.value}"
             )
+
+    @staticmethod
+    def _normalize_id(value: object) -> str | None:
+        """规范化 ID 类字段。
+
+        将 None、空串、以及字符串形式的 "None"/"null"（大小写不敏感）统一归一为 None，
+        其余值 strip 后转为 str 返回。
+
+        避免 str(None) == "None" 这类真值字符串毒化群聊/私聊判定：
+        私聊 group_id 本应为空，若被写成 "None"（真值）会让 `if self.group_id` 误判为群聊。
+        真实数字串（如群号 "123456"）经此函数原样返回，行为零变化。
+        """
+        if value is None:
+            return None
+        s = str(value).strip()
+        if not s or s.lower() in ("none", "null"):
+            return None
+        return s
 
     def _validate_chat_type(self) -> bool:
         """验证当前聊天类型是否允许执行此Action

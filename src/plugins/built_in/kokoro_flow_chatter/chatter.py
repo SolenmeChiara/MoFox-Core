@@ -117,6 +117,18 @@ class KokoroFlowChatter(BaseChatter):
                 if not unread_messages:
                     return self._build_result(success=True, message="no_unread_messages")
 
+                # 1.5 捕获本轮打断基线（回合快照时刻）
+                #     语义：本轮理解快照（此刻的未读 ∪ 缓存）之后到达的一切消息都算"新消息"。
+                #     必须在 planner LLM(~15s) 之前捕获——若延后到 kfc_reply 动作起始才采集，
+                #     planner 期间到达并进入 message_cache 的消息会被误划入基线而漏判打断
+                #     （时序盲区）。基线随 action_data 传给 kfc_reply 动作消费。
+                interrupt_baseline_time = time.time()
+                interrupt_baseline_ids = self._collect_known_message_ids(context)
+                logger.debug(
+                    f"[KFC] 回合打断基线已捕获(来源=回合快照): 已知消息 "
+                    f"{len(interrupt_baseline_ids)} 条, baseline_time={interrupt_baseline_time:.3f}"
+                )
+
                 # 2. 取最后一条消息作为主消息
                 target_message = unread_messages[-1]
                 user_info = target_message.user_info
@@ -235,6 +247,12 @@ class KokoroFlowChatter(BaseChatter):
                 for idx, action in enumerate(plan_response.actions, 1):
                     logger.debug(f"[KFC] 执行第 {idx}/{len(plan_response.actions)} 个动作: {action.type}")
                     action_data = action.params.copy()
+
+                    # 将本轮回合快照基线传给回复动作。仅注入副本 action_data，不写回
+                    # action.params，避免混入打断时的 to_dict() 存档与 store_action_info 序列化。
+                    if action.type == "kfc_reply":
+                        action_data["_interrupt_baseline_time"] = interrupt_baseline_time
+                        action_data["_interrupt_baseline_ids"] = interrupt_baseline_ids
 
                     try:
                         result = await self.action_manager.execute_action(
@@ -371,6 +389,31 @@ class KokoroFlowChatter(BaseChatter):
 
             finally:
                 self._processing = False
+
+    @staticmethod
+    def _collect_known_message_ids(context: StreamContext) -> set[str]:
+        """采集回合快照时刻的已知消息ID（未读 ∪ 处理期缓存）。
+
+        与 KFCReplyAction._capture_interrupt_baseline 的采集语义保持一致：这些ID构成本轮
+        打断基线，只有不在此集合中的消息才被视为"生成期间新到的消息"从而触发打断。
+        采集失败时降级返回已收集部分，不阻断主流程。
+        """
+        ids: set[str] = set()
+        try:
+            for msg in context.get_unread_messages() or []:
+                mid = str(getattr(msg, "message_id", "") or "")
+                if mid:
+                    ids.add(mid)
+        except Exception:
+            pass
+        try:
+            for msg in list(context.message_cache):
+                mid = str(getattr(msg, "message_id", "") or "")
+                if mid:
+                    ids.add(mid)
+        except Exception:
+            pass
+        return ids
 
     async def _execute_unified_mode(
         self,
