@@ -78,6 +78,7 @@ async def conversation_loop(
     """
     tick_count = 0
     last_interval = None
+    is_private_stream: bool | None = None  # 私聊标记缓存（一次确定后复用，流的群/私聊属性固定）
 
     while is_running_func():
         try:
@@ -97,6 +98,49 @@ async def conversation_loop(
 
             # 4. 检查是否需要强制分发
             force_dispatch = check_force_dispatch_func(context, unread_count)
+
+            # 4.5 私聊静默期防抖（仅私聊、非强制分发时生效；群聊路径零改动）
+            #     - 最新未读消息 age < merge_window：用户可能还在连打，短睡后重查，不产出 Tick
+            #     - 饥饿保护：最老未读等待 >= max(merge_window*4, 12s) 时强制产出，防止持续输入导致永不回复
+            if unread_count > 0 and not force_dispatch and global_config is not None:
+                # 一次性确定并缓存私聊标记（用 group_info 权威判定，避免 chat_type 检测不可靠）
+                if is_private_stream is None:
+                    try:
+                        _cs = await get_chat_manager().get_stream(stream_id)
+                        if _cs is not None:
+                            is_private_stream = not _cs.group_info
+                    except Exception:
+                        is_private_stream = None  # 拿不到流信息则保持未知，下轮再试，不启用防抖
+
+                if is_private_stream:
+                    merge_window = getattr(global_config.chat, "private_message_merge_window", 3.0)
+                    now = time.time()
+                    msg_times = [
+                        t
+                        for t in (float(getattr(m, "time", 0.0) or 0.0) for m in unread_messages)
+                        if t > 0
+                    ]
+                    if msg_times:
+                        newest_age = now - max(msg_times)
+                        oldest_age = now - min(msg_times)
+                        starvation_limit = max(merge_window * 4, 12.0)
+
+                        if newest_age < merge_window and oldest_age < starvation_limit:
+                            # 仍在静默窗口内且未触发饥饿保护：短睡后重查，不产出 Tick
+                            logger.debug(
+                                f"[生成器] stream={stream_id[:8]}, 私聊静默期防抖: "
+                                f"最新消息age={newest_age:.2f}s < 窗口{merge_window:.2f}s, "
+                                f"剩余{max(0.0, merge_window - newest_age):.2f}s, 最老age={oldest_age:.2f}s"
+                            )
+                            await asyncio.sleep(0.5)
+                            continue
+
+                        if oldest_age >= starvation_limit and newest_age < merge_window:
+                            # 饥饿保护：用户持续输入，最老未读已等待过久，强制产出
+                            logger.info(
+                                f"[生成器] stream={stream_id[:8]}, 私聊饥饿保护触发: "
+                                f"最老未读已等待{oldest_age:.2f}s >= 上限{starvation_limit:.2f}s, 强制产出Tick"
+                            )
 
             # 5. 如果有消息，产出 Tick
             if unread_count > 0 or force_dispatch:

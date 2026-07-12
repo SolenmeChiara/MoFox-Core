@@ -56,6 +56,9 @@ class ProactiveThinker:
     # 连续思考触发点（等待进度百分比）
     THINKING_TRIGGERS = [0.3, 0.6, 0.85]
 
+    # 主链路活动互斥窗口（秒）：距主链路最近一次活动小于该值时，ProactiveThinker 不出稿
+    MAIN_CHAIN_ACTIVE_WINDOW = 30.0
+
     # 任务名称
     TASK_WAITING_CHECK = "kfc_waiting_check"
     TASK_PROACTIVE_CHECK = "kfc_proactive_check"
@@ -268,19 +271,21 @@ class ProactiveThinker:
             persona_block = prompt_builder._build_persona_block()
 
             # 获取关系信息
+            # RelationshipManager 没有 get_relationship() 方法，其返回对象也没有 intimacy/description 字段，
+            # 旧写法必然抛异常。改用 RelationshipFetcher.build_relation_info（返回可直接用的关系描述字符串，
+            # 与 context_builder._build_relation_info 一致）。
             relation_block = f"你与 {user_name} 还不太熟悉。"
             try:
-                # 模块级 relationship_manager 是惰性单例（初始为 None，靠工厂实例化），
-                # 直接 from-import 会拿到 None，必须走 get_relationship_manager()
-                from src.person_info.relationship_manager import get_relationship_manager
+                from src.person_info.relationship_fetcher import relationship_fetcher_manager
 
                 person_info_manager = await self._get_person_info_manager()
                 if person_info_manager:
                     platform = global_config.bot.platform if global_config else "qq"
                     person_id = person_info_manager.get_person_id(platform, session.user_id)
-                    relationship = await get_relationship_manager().get_relationship(person_id)
-                    if relationship:
-                        relation_block = f"你与 {user_name} 的亲密度是 {relationship.intimacy}。{relationship.description or ''}"
+                    relationship_fetcher = relationship_fetcher_manager.get_fetcher(session.stream_id)
+                    relation_info = await relationship_fetcher.build_relation_info(person_id, points_num=5)
+                    if relation_info:
+                        relation_block = relation_info
             except Exception as e:
                 logger.debug(f"获取关系信息失败: {e}")
 
@@ -387,12 +392,8 @@ class ProactiveThinker:
             logger.debug(f"[ProactiveThinker] Session {session.user_id} 已不在等待状态，跳过超时处理")
             return
 
-        # 再次检查最近活动时间
-        time_since_last_activity = time.time() - session.last_activity_at
-        if time_since_last_activity < 5:
-            logger.debug(
-                f"[ProactiveThinker] Session {session.user_id} 刚有活动，跳过超时处理"
-            )
+        # 硬闸：主链路正在处理或最近活跃时跳过，避免与主链路并发出稿
+        if await self._main_chain_busy(session):
             return
 
         # 增加连续超时计数
@@ -635,12 +636,8 @@ class ProactiveThinker:
         """处理主动思考 - 支持双模式"""
         self._stats["proactive_triggered"] += 1
 
-        # 再次检查最近活动时间，防止与 Chatter 并发
-        time_since_last_activity = time.time() - session.last_activity_at
-        if time_since_last_activity < 5:
-            logger.debug(
-                f"[ProactiveThinker] Session {session.user_id} 刚有活动，跳过主动思考"
-            )
+        # 硬闸：主链路正在处理或最近活跃时跳过，避免与主链路并发出稿
+        if await self._main_chain_busy(session):
             return
 
         logger.info(f"主动思考触发: user={session.user_id}, reason={trigger_reason}")
@@ -789,6 +786,41 @@ class ProactiveThinker:
 
         except Exception as e:
             logger.error(f"[ProactiveThinker] 主动思考失败: {e}")
+
+    async def _main_chain_busy(self, session: KokoroSession) -> bool:
+        """判断主链路（Chatter）是否正在处理或最近活跃，用于防止 ProactiveThinker 与主链路并发出稿。
+
+        两道硬闸，命中任一即返回 True（本次跳过）：
+        1. 目标 stream 的 context.is_chatter_processing == True（主链路正在生成）
+        2. 距主链路最近一次活动 < MAIN_CHAIN_ACTIVE_WINDOW 秒。信号取 session.last_activity_at，
+           它由 Chatter 在处理起始即刻更新（见 chatter.py "立即更新活动时间，阻止 ProactiveThinker 并发处理"）。
+
+        失败隔离：任何异常都放行（返回 False），保持旧行为，宁可多说话不可崩。
+        """
+        try:
+            # 硬闸1：主链路正在处理
+            chat_stream = await self._get_chat_stream(session.stream_id)
+            context = getattr(chat_stream, "context", None) if chat_stream else None
+            if context is not None and getattr(context, "is_chatter_processing", False):
+                logger.debug(
+                    f"[ProactiveThinker] Session {session.user_id} 主链路正在处理"
+                    f"(is_chatter_processing)，跳过"
+                )
+                return True
+
+            # 硬闸2：主链路最近活跃
+            time_since_last_activity = time.time() - session.last_activity_at
+            if time_since_last_activity < self.MAIN_CHAIN_ACTIVE_WINDOW:
+                logger.debug(
+                    f"[ProactiveThinker] Session {session.user_id} 主链路 "
+                    f"{time_since_last_activity:.1f}s 前活跃 (<{self.MAIN_CHAIN_ACTIVE_WINDOW:.0f}s)，跳过"
+                )
+                return True
+
+            return False
+        except Exception as e:
+            logger.debug(f"[ProactiveThinker] 主链路忙碌检查异常，放行旧行为: {e}")
+            return False
 
     async def _get_chat_stream(self, stream_id: str):
         """获取聊天流"""

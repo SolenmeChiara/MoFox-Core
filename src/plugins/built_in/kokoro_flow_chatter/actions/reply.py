@@ -11,6 +11,7 @@ KFC 的 reply 动作：
 """
 
 import asyncio
+import time
 from typing import TYPE_CHECKING, ClassVar, Optional
 
 from src.common.logger import get_logger
@@ -84,6 +85,11 @@ class KFCReplyAction(BaseAction):
     async def execute(self) -> tuple[bool, str]:
         """执行 reply 动作 - 完整的回复流程"""
         try:
+            # 0. 记录本轮生成开始的打断基线（时间戳 + 已知消息ID集合）。
+            #    用于分段发送时的间隙自检：只对本轮生成开始之后新到的消息反应，
+            #    避免把本轮触发时就已在未读/缓存里的消息误判为打断信号。
+            self._capture_interrupt_baseline()
+
             # 1. 检查是否有预生成的内容
             content = self.action_data.get("content", "")
 
@@ -228,6 +234,18 @@ class KFCReplyAction(BaseAction):
                 if not segment or not segment.strip():
                     continue
 
+                # 发送前自检：本轮生成开始后若有新消息到达，中断剩余分段（含第一段）。
+                # 第一段之前的检查覆盖 replyer LLM 生成的 20-40s 窗口内新到的消息。
+                if await self._should_interrupt():
+                    logger.info(
+                        f"{self.log_prefix} 发送间隙检测到新消息，中断剩余分段"
+                        f"（已发送 {i} 段，剩余 {len(segments) - i} 段）"
+                    )
+                    raise KFCInterruptionError(
+                        partial_reply=reply_text,
+                        unsend_segments=list(segments[i:]),
+                    )
+
                 reply_text += segment
 
                 # 发送消息
@@ -285,52 +303,86 @@ class KFCReplyAction(BaseAction):
                 unsend_segments=[] # 无法获取剩余部分，但这不重要，因为会重新规划
             )
 
+    def _capture_interrupt_baseline(self) -> None:
+        """记录本轮生成开始时的打断基线。
+
+        基线包含：
+        - _interrupt_baseline_time: execute() 起始时间戳
+        - _interrupt_baseline_ids: 起始时已知的所有消息ID（未读 + 缓存）
+
+        用于 _should_interrupt 区分"本轮触发时就已存在的消息"和"生成期间新到的消息"，
+        避免把本轮的触发消息误判为打断信号。失败时降级为仅时间基线，不阻断主流程。
+        """
+        self._interrupt_baseline_time = time.time()
+        ids: set[str] = set()
+        try:
+            context = getattr(self.chat_stream, "context", None) if self.chat_stream else None
+            if context:
+                for msg in context.get_unread_messages() or []:
+                    mid = str(getattr(msg, "message_id", "") or "")
+                    if mid:
+                        ids.add(mid)
+                try:
+                    for msg in list(context.message_cache):
+                        mid = str(getattr(msg, "message_id", "") or "")
+                        if mid:
+                            ids.add(mid)
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.debug(f"{self.log_prefix} 捕获打断基线失败: {e}")
+        self._interrupt_baseline_ids = ids
+        logger.debug(
+            f"{self.log_prefix} 打断基线已捕获: 已知消息 {len(ids)} 条, "
+            f"baseline_time={self._interrupt_baseline_time:.3f}"
+        )
+
     async def _should_interrupt(self) -> bool:
-        """
-        检查是否应该打断回复
+        """检查是否应该打断回复（发送间隙自检）。
 
-        如果收到比当前处理的消息更新的消息，则视为打断
+        仅当本轮生成开始之后有新消息到达时返回 True，通过 execute() 起始记录的
+        基线（时间戳 + 已知消息ID集合）区分新旧消息，避免误判本轮触发消息。
+
+        处理期间新消息可能进入缓存（is_chatter_processing 时），也可能直接进未读
+        （未启用缓存时），因此两者都要检查。
         """
-        if not self.chat_stream or not self.chat_stream.context:
+        chat_stream = self.chat_stream
+        context = getattr(chat_stream, "context", None) if chat_stream else None
+        if not context:
             return False
 
-        # 获取当前未读消息
-        current_unread = self.chat_stream.context.get_unread_messages()
-        if not current_unread:
+        baseline_time = getattr(self, "_interrupt_baseline_time", 0.0)
+        baseline_ids = getattr(self, "_interrupt_baseline_ids", None) or set()
+
+        # 汇总候选消息：未读 + 处理期间缓存
+        candidates = list(context.get_unread_messages() or [])
+        try:
+            candidates.extend(list(context.message_cache))
+        except Exception:
+            pass
+
+        if not candidates:
             return False
 
-        # 获取目标消息时间（我们正在回复的消息）
-        target_time = 0.0
-        target_id = ""
+        for msg in candidates:
+            msg_id = str(getattr(msg, "message_id", "") or "")
 
-        if self.action_message:
-            if isinstance(self.action_message, dict):
-                target_time = float(self.action_message.get("time", 0.0) or 0.0)
-                target_id = str(self.action_message.get("message_id", ""))
+            if msg_id:
+                # 主判据：不在本轮基线集合中的消息即为新消息
+                # （基线集合已覆盖本轮触发时的所有已知未读/缓存消息）
+                if msg_id in baseline_ids:
+                    continue
             else:
-                target_time = float(getattr(self.action_message, "time", 0.0) or 0.0)
-                target_id = str(getattr(self.action_message, "message_id", ""))
+                # 兜底：无有效 msg_id 时，用时间戳判断是否晚于本轮基线（+0.05s 抗抖动）
+                msg_time = float(getattr(msg, "time", 0.0) or 0.0)
+                if baseline_time > 0 and msg_time <= baseline_time + 0.05:
+                    continue
 
-        # 如果没有目标消息时间，默认打断（可能是主动发起的回复，有新消息就停）
-        if target_time <= 0:
-            # 如果是主动发起的，检查所有未读消息
-            if current_unread:
-                logger.debug(f"{self.log_prefix} 发现新消息(主动发起场景), 触发打断")
-                return True
-            return False
-
-        # 检查是否有更新的用户消息
-        for msg in current_unread:
-            # 必须是有效的消息时间
-            msg_time = float(getattr(msg, "time", 0.0) or 0.0)
-            msg_id = str(getattr(msg, "message_id", ""))
-
-            # 如果消息时间明显晚于目标消息（加0.1s缓冲）
-            # 并且不是目标消息本身（通过ID判断）
-            if msg_time > target_time + 0.1:
-                if msg_id != target_id:
-                    logger.debug(f"{self.log_prefix} 发现新消息(time={msg_time}), 触发打断")
-                    return True
+            logger.debug(
+                f"{self.log_prefix} 检测到本轮生成后的新消息 "
+                f"(id={msg_id}, baseline_time={baseline_time:.3f})，将触发打断"
+            )
+            return True
 
         return False
 
