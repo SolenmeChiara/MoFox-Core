@@ -1241,13 +1241,26 @@ class QZoneService:
 
                 try:
                     # 楼中楼语义（nested-on 时）：
-                    #   commentUin = 被回复的那个人（replier_uin，子回复作者）——与 commentId 是不同主体；
                     #   commentId  = 该子回复归并后的**顶层楼锚点**（rep.parent_tid），不是子回复自己的 rep_tid。
+                    #   commentUin = 该顶层楼的**作者**（楼主），非被回复者——被回复者仅由 content 的 @token 表达。
                     # QZone 楼中楼只一层、parent 全归并到顶层，锚点必须挂顶层楼，否则挂错层/触发 -10049。
                     # 平铺顶层候选（路 b）无 parent_tid，回退用裸 rep_tid。off 路仍用第5参 rep_tid 当 parent_tid（零变化）。
                     nested_top_tid = rep.get("parent_tid") or rep_tid
+                    # 定位顶层楼作者作 commentUin：comments 里找 comment_tid==nested_top_tid 且非 is_sub 的顶层
+                    # 评论取其 qq_account（自楼里该楼可能是 bot 起的，也可能是别人起的）。查不到→回退被回复者。
+                    _top_tid_str = str(nested_top_tid)
+                    nested_owner_uin = replier_uin
+                    for _c in comments:
+                        if not isinstance(_c, dict) or _c.get("is_sub"):
+                            continue
+                        if str(_c.get("comment_tid")) == _top_tid_str:
+                            _owner = str(_c.get("qq_account", "") or "")
+                            if _owner:
+                                nested_owner_uin = _owner
+                            break
                     ok = await api_client["reply"](
-                        fid, qq_account, replier_name, reply_content, rep_tid, replier_uin, nested_top_tid
+                        fid, qq_account, replier_name, reply_content, rep_tid, replier_uin,
+                        nested_top_tid, nested_owner_uin,
                     )
                 except Exception as e:
                     logger.error(f"[自楼接话] 回复接口异常(fid={fid}, uin={replier_uin}): {e}")
@@ -1707,11 +1720,12 @@ class QZoneService:
                         logger.info(f"[接话] 对 {replier_name} 的回复选择不接话（客套/无实质内容/生成失败）")
                         continue
 
-                    # commentId 用 bot 自己的评论楼层序号：把接话挂在 bot 起的楼里；
-                    # commentUin/@token 指向被回复的那个人（replier_uin），二者是不同主体（别混）。
+                    # commentId 用 bot 自己的评论楼层序号：把接话挂在 bot 起的楼里（楼主恒为 bot）。
+                    # commentUin=顶层楼作者=bot（qq_account）；@token 才指向被回复者(replier_uin)——不同主体。
                     parent_tid = bot_tid or rep_tid
                     ok = await api_client["reply"](
-                        fid, host_qq, replier_name, thread_reply, parent_tid, replier_uin
+                        fid, host_qq, replier_name, thread_reply, parent_tid, replier_uin,
+                        nested_owner_uin=qq_account,
                     )
                     if ok:
                         self.comment_tracking.record_reply(fid, replier_uin)
@@ -2425,17 +2439,32 @@ class QZoneService:
                 logger.error(f"点赞说说异常: {e}")
                 return False
 
-        async def _reply(fid, host_qq, target_name, content, comment_tid, comment_uin=None, nested_comment_id=None):
+        async def _reply(
+            fid,
+            host_qq,
+            target_name,
+            content,
+            comment_tid,
+            comment_uin=None,
+            nested_comment_id=None,
+            nested_owner_uin=None,
+        ):
             """回复评论 - 修复为能正确提醒的回复格式。
 
             :param comment_tid: off（平铺）路径下写入 ``parent_tid`` 的楼层序号 tid，原样字符串。
             :param comment_uin: 被回复评论**作者**的 QQ（楼中楼路径必填）；
                                 None 时表示调用方未提供，将回退到平铺 parent_tid 逻辑。
+                                nested-on 时仅用于 content 的 ``@token``（结构化提醒被回复者）。
             :param nested_comment_id: 仅 nested-on 路径使用的 ``commentId``（顶层楼锚点 tid）。
                                 QZone 楼中楼只一层、parent 全归并到顶层，故 commentId 语义是「顶层楼的 tid」
                                 （见本文件 _detect_replies_to_own_comments 的 2026-07-09 真机实证注释）。
                                 子回复候选须传归并后的顶层 parent；缺省（None）时回退用 ``comment_tid``。
                                 与旧 parent_tid 语义**不同**，故独立入参，避免污染 off 路径。
+            :param nested_owner_uin: nested-on 路径的 ``commentUin`` —— 真机语义 = ``commentId`` 所指
+                                **顶层楼的作者** QQ（不是被回复者！被回复者只由 content 的 @token 表达）。
+                                2026-07-10 真机抓包确诊：好友空间里楼是 bot 起的（作者=bot），旧代码误传
+                                「被回复者」→ 语义错 → 服务端 -10049 反爬。自己空间下「楼作者==被回复者」
+                                恒成立故旧代码碰巧成功。缺省（None）时回退 ``comment_uin``（保 A 调用点零改动）。
 
             两条互斥路径：
             - ``monitor.use_nested_reply=True`` 且拿得到 comment_uin：走真正的楼中楼嵌套回复
@@ -2447,15 +2476,6 @@ class QZoneService:
                 use_nested = bool(self.get_config("monitor.use_nested_reply", False)) and bool(comment_uin)
                 # nested-on 的 commentId：优先用调用方给的顶层楼锚点，缺省回退 comment_tid。
                 nested_cid = nested_comment_id if nested_comment_id is not None else comment_tid
-
-                # --- 楼中楼实验常量（实验性，出结论后移除或转正）---
-                # 仅作用于「nested=on 且 host_qq != uin（好友空间）」路径，用于鉴别好友说说下固定
-                # 返回 -10049 的成因：假设A=突发限流（等一等重发即通）；假设B=qzreferrer 校验
-                # （硬编码 bot 主页 referrer 与 hostUin 不符被反爬拒）。自楼与平铺路径均不受影响。
-                _EXP_BUSY_CODE = -10049  # 服务端「使用人数过多，请稍后再试」业务码
-                _EXP_PRE_SLEEP = (15.0, 30.0)  # 首发前呼吸区间（秒）：模拟真人读→回，并与详情拉取风暴解耦
-                _EXP_RETRY_SLEEP = (90.0, 150.0)  # 每次 -10049 后的重试等待区间（秒）
-                _EXP_MAX_ATTEMPTS = 3  # 最大尝试数：baseline / retry-after-wait / host-referrer
 
                 async def _post_reply(data):
                     """发送回复 payload 并解析业务码，供三条路径共用。
@@ -2510,96 +2530,48 @@ class QZoneService:
                         body = body[len(at_prefix):]
                     at_token = f"@{{uin:{comment_uin},nick:{target_name},auto:1}} {body}"
 
-                    def _build_nested_data(qzreferrer):
-                        """构造嵌套回复 payload；仅 qzreferrer 可变，其余字段与真机抓包一致。"""
+                    # commentUin 真机语义 = commentId 所指顶层楼的**作者**（楼主），非被回复者；
+                    # 被回复者仅由 content 的 @token 表达。缺省回退 comment_uin（保 A 调用点旧行为）。
+                    nested_owner = nested_owner_uin or comment_uin
+
+                    def _build_nested_data():
+                        """构造嵌套回复 payload；字段与顺序对齐真机抓包（2026-07-10）。
+
+                        ``qzreferrer`` 统一为宿主空间页 ``https://user.qzone.qq.com/{host_qq}``（无 /main）：
+                        好友空间取好友主页，自楼时 host_qq==uin 等价于 ``…/{uin}``，与真机客户端一致。
+                        新增真机含的 ``isSignIn``（空串）字段；其余字段维持现值。
+                        """
                         return {
                             "topicId": f"{host_qq}_{fid}__1",
-                            "commentId": nested_cid,
-                            "commentUin": comment_uin,
-                            "uin": uin,
-                            "hostUin": host_qq,
-                            "content": at_token,
                             "feedsType": 100,
                             "inCharset": "utf-8",
                             "outCharset": "utf-8",
-                            "format": "fs",
                             "plat": "qzone",
                             "source": "ic",
+                            "hostUin": host_qq,
+                            "isSignIn": "",
                             "platformid": 52,
+                            "uin": uin,
+                            "format": "fs",
                             "ref": "feeds",
-                            "richtype": "",
+                            "content": at_token,
+                            "commentId": nested_cid,
+                            "commentUin": nested_owner,
                             "richval": "",
-                            "paramstr": "2",
+                            "richtype": "",
                             "private": "0",
-                            "qzreferrer": qzreferrer,
+                            "paramstr": "2",
+                            "qzreferrer": f"https://user.qzone.qq.com/{host_qq}",
                         }
 
-                    if str(host_qq) != str(uin):
-                        # === 楼中楼实验（好友空间 host_qq != uin）===
-                        # 三级阶梯：仅当业务码恰为 -10049 才进下一级；其它码（含成功/假定成功）维持现状直接返回。
-                        default_referrer = f"https://user.qzone.qq.com/{uin}/main"
-                        # 与 default_referrer 只差 uin→host_qq 一个变量（保留 /main），保证变体3归因纯净
-                        host_referrer = f"https://user.qzone.qq.com/{host_qq}/main"
-                        # (变体名, qzreferrer, 该次尝试前的等待区间；None 表示不等)
-                        variants = [
-                            ("baseline", default_referrer, None),
-                            ("retry-after-wait", default_referrer, _EXP_RETRY_SLEEP),
-                            ("host-referrer", host_referrer, _EXP_RETRY_SLEEP),
-                        ]
-                        _hyp_of = {
-                            "baseline": "基线首发即成功（既非A也非B，可能偶发）",
-                            "retry-after-wait": "假设A（突发限流）成立",
-                            "host-referrer": "假设B（referrer校验）成立",
-                        }
-
-                        # 首发前呼吸：模拟真人从读到回的间隔，同时与前面的详情拉取请求风暴解耦。
-                        pre_sleep = random.uniform(*_EXP_PRE_SLEEP)
-                        logger.info(f"[楼中楼实验] 好友空间 host={host_qq} 首发前呼吸 {pre_sleep:.0f}s")
-                        await asyncio.sleep(pre_sleep)
-
-                        last_ret = False
-                        for idx, (variant, referrer, retry_sleep) in enumerate(variants, start=1):
-                            waited = 0.0
-                            if retry_sleep is not None:
-                                waited = random.uniform(*retry_sleep)
-                                await asyncio.sleep(waited)
-                            data = _build_nested_data(referrer)
-                            # 首轮打全量参数便于核对；后续仅打变体差异（qzreferrer）便于对比排障。
-                            if idx == 1:
-                                logger.info(
-                                    f"[楼中楼] 回复参数 nested=on commentId={nested_cid} "
-                                    f"commentUin={comment_uin} topicId={data['topicId']} content='{at_token[:60]}...'"
-                                )
-                                logger.debug(f"[楼中楼] 回复完整data(脱敏): {data}")
-                            else:
-                                logger.info(f"[楼中楼] 回复参数(重试 variant={variant}) qzreferrer={referrer}")
-                            ret, code = await _post_reply(data)
-                            logger.info(
-                                f"[楼中楼实验] 尝试{idx}/{_EXP_MAX_ATTEMPTS} variant={variant} "
-                                f"等待{waited:.0f}s后{'发送' if idx == 1 else '重发'} → code={code}"
-                            )
-                            last_ret = ret
-                            if code == 0:
-                                logger.info(f"[楼中楼实验] ★ variant={variant} 成功，{_hyp_of.get(variant, variant)}")
-                                return True
-                            if code != _EXP_BUSY_CODE:
-                                # 非 -10049 的其它结果（失败码 / 假定成功）：维持现状，不再重试。
-                                logger.info(
-                                    f"[楼中楼实验] variant={variant} 返回非限流码 code={code}，停止实验（维持现状）"
-                                )
-                                return ret
-                            # code == -10049 → 继续下一级（若已是末级，循环结束后返回 last_ret）
-                        logger.info(
-                            f"[楼中楼实验] 三级阶梯均为 {_EXP_BUSY_CODE}，假设A/B 均未验证成立（或限流持续），放弃"
-                        )
-                        return last_ret
-
-                    # --- 自楼（host_qq == uin）：零改动，沿用 bot 主页 referrer ---
-                    data = _build_nested_data(f"https://user.qzone.qq.com/{uin}/main")
-                    # 脱敏日志（不含 g_tk/cookie）：确认参数正确 + 走了嵌套路
+                    # 好友空间与自楼共用单次发送：实验已出结论（好友空间 -10049 非限流、非单独 referrer
+                    # 问题，而是 commentUin 语义写反），故移除三级重试阶梯与首发呼吸。
+                    data = _build_nested_data()
+                    # 脱敏日志（不含 g_tk/cookie）：确认走了嵌套路 + 核对 commentUin(楼主) 与被回复者语义
                     logger.info(
                         f"[楼中楼] 回复参数 nested=on commentId={nested_cid} "
-                        f"commentUin={comment_uin} topicId={data['topicId']} content='{at_token[:60]}...'"
+                        f"commentUin={nested_owner}(楼主) 被回复={comment_uin} "
+                        f"host={host_qq} topicId={data['topicId']} content='{at_token[:60]}...'"
                     )
                     # data 本身不含 g_tk/cookie（g_tk 仅在 query params，cookie 在请求头），可直接打
                     logger.debug(f"[楼中楼] 回复完整data(脱敏): {data}")
