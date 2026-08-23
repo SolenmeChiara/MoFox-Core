@@ -14,6 +14,7 @@ import filetype
 
 if TYPE_CHECKING:
     from .person_memory_service import PersonMemoryService
+    from .weather_service import WeatherService
 
 from src.common.logger import get_logger
 from src.llm_models.exceptions import ModelRefusalException
@@ -37,15 +38,41 @@ class ContentService:
     内容服务类，封装了所有与大语言模型（LLM）交互以生成文本的逻辑。
     """
 
-    def __init__(self, get_config: Callable, person_memory: "PersonMemoryService | None" = None):
+    def __init__(
+        self,
+        get_config: Callable,
+        person_memory: "PersonMemoryService | None" = None,
+        weather: "WeatherService | None" = None,
+    ):
         """
         初始化内容服务。
 
         :param get_config: 一个函数，用于从插件主类获取配置信息。
         :param person_memory: 空间人物记忆服务（可选），用于在生成评论/回复时调取对方的空间互动往事。
+        :param weather: 天气服务（可选），用于给发说说的提示词注入当天天气与生效预警的背景信息。
         """
         self.get_config = get_config
         self.person_memory = person_memory
+        self.weather = weather
+
+    async def _build_weather_section(self) -> str:
+        """
+        取一段可直接嵌进提示词的天气背景。
+
+        返回值要么是空字符串（未配置天气服务 / 未启用 / 获取失败），要么是 ``"\\n\\n<块>"``：
+        开头自带空行、结尾**不带**换行，调用方只需把它**追加在锚点行末尾**，由模板原有的换行
+        收尾。为空时渲染结果与改动前逐字一致，不会多出空行或留下孤立标题。
+
+        天气纯属锦上添花，这里再兜一层异常，保证任何情况下都不阻断发说说。
+        """
+        if not self.weather:
+            return ""
+        try:
+            block = await self.weather.get_weather_block()
+        except Exception as e:
+            logger.warning(f"获取天气背景信息失败，本次说说不带天气: {e}")
+            return ""
+        return f"\n\n{block}" if block else ""
 
     async def generate_story(self, topic: str, context: str | None = None) -> str:
         """
@@ -83,6 +110,9 @@ class ContentService:
                 personality_desc += f"\n你的人格侧面：{bot_personality_side}"
             personality_desc += f"\n\n你的表达方式：{bot_reply_style}"
 
+            # 天气背景（可选）：动态数据，必须放在缓存断点标记之后，否则每半小时击穿一次人设缓存
+            weather_section = await self._build_weather_section()
+
             # 构建提示词
             # 人设（含表达方式，静态大块）之后插入缓存断点标记：anthropic 客户端会在此处
             # 拆块打 cache_control 命中 prompt cache；其他客户端发送前自动剥离标记
@@ -90,7 +120,7 @@ class ContentService:
             prompt = f"""
 {personality_desc}
 {CACHE_BREAKPOINT_MARKER}
-现在是{current_time}（{weekday}），你想写一条{prompt_topic}的说说发表在qq空间上。
+现在是{current_time}（{weekday}），你想写一条{prompt_topic}的说说发表在qq空间上。{weather_section}
 
 请严格遵守以下规则：
             1.  **绝对禁止**在说说中直接、完整地提及当前的年月日或几点几分。
@@ -292,11 +322,14 @@ class ContentService:
 """
                 output_format = """{"text": "说说正文内容", "image": {"prompt": "详细的英文描述（主体+场景+氛围+光线+细节）"}}"""
 
+            # 天气背景（可选）：动态数据，必须放在缓存断点标记之后，否则每半小时击穿一次人设缓存
+            weather_section = await self._build_weather_section()
+
             # 人设块后插入缓存断点标记（anthropic 命中缓存用，其他客户端自动剥离）
             prompt = f"""
 {personality_desc}
 {CACHE_BREAKPOINT_MARKER}
-现在是{current_time}（{weekday}），你想写一条{prompt_topic}的说说发表在qq空间上。
+现在是{current_time}（{weekday}），你想写一条{prompt_topic}的说说发表在qq空间上。{weather_section}
 
 **说说文本规则：**
 1. **绝对禁止**在说说中直接、完整地提及当前的年月日或几点几分。
@@ -1521,9 +1554,12 @@ class ContentService:
             weekday_names = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
             weekday = weekday_names[now.weekday()]
 
+            # 天气背景（可选）。本函数没有缓存断点标记，保持既有行为不额外添加
+            weather_section = await self._build_weather_section()
+
             # 构建基于活动的提示词
             prompt = f"""
-            你是'{bot_personality}'，现在是{current_time}（{weekday}），根据你当前的日程安排，你正在'{activity}'。
+            你是'{bot_personality}'，现在是{current_time}（{weekday}），根据你当前的日程安排，你正在'{activity}'。{weather_section}
             请基于这个活动写一条说说发表在qq空间上。
             {bot_expression}
 

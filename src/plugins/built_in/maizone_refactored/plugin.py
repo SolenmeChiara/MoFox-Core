@@ -28,6 +28,7 @@ from .services.reply_tracker_service import ReplyTrackerService
 from .services.repost_tracking_service import RepostTrackingService
 from .services.scheduler_service import SchedulerService
 from .services.social_loop_service import SocialLoopService
+from .services.weather_service import WeatherService
 
 logger = get_logger("MaiZone.Plugin")
 
@@ -122,6 +123,29 @@ class MaiZoneRefactoredPlugin(BasePlugin):
             "random_interval_max_minutes": ConfigField(type=int, default=135, description="随机间隔分钟数上限"),
             "forbidden_hours_start": ConfigField(type=int, default=2, description="禁止发送的开始小时(24小时制)"),
             "forbidden_hours_end": ConfigField(type=int, default=6, description="禁止发送的结束小时(24小时制)"),
+        },
+        "weather": {
+            "enable": ConfigField(
+                type=bool,
+                default=False,
+                description="是否给「发说说」注入真实天气背景：发说说时抓取当天天气与生效中的天气预警，"
+                "作为背景信息插进内容生成提示词（带缓存；接口失败静默降级为不带天气，绝不阻断发说说）。"
+                "数据源为加拿大环境部公开接口 api.weather.gc.ca，免 API key，仅覆盖加拿大城市",
+            ),
+            "identifier": ConfigField(
+                type=str,
+                default="on-24",
+                description="weather.gc.ca 的 citypage 城市代码（格式为「省份缩写-编号」，on-24 = 安大略省密西沙加）",
+                example="on-24",
+            ),
+            "city_name": ConfigField(
+                type=str, default="密西沙加", description="提示词里显示的城市名（仅影响文案，不影响取哪座城市的数据）"
+            ),
+            "cache_ttl_minutes": ConfigField(
+                type=int,
+                default=30,
+                description="天气结果缓存分钟数（获取失败另有 300 秒负缓存，避免接口宕机时反复空等超时）",
+            ),
         },
         "cookie": {
             "http_fallback_host": ConfigField(
@@ -230,7 +254,11 @@ class MaiZoneRefactoredPlugin(BasePlugin):
         # --- 创建并注册所有服务实例 ---
         # 空间人物记忆服务：注册互动对象进记人系统 + 积累/调取空间互动记忆
         person_memory_service = PersonMemoryService(self.get_config)
-        content_service = ContentService(self.get_config, person_memory=person_memory_service)
+        # 天气背景服务：发说说时注入当天天气 + 生效预警（默认关闭；失败静默降级为不带天气）
+        weather_service = WeatherService(self.get_config)
+        content_service = ContentService(
+            self.get_config, person_memory=person_memory_service, weather=weather_service
+        )
         image_service = ImageService(self.get_config)
         cookie_service = CookieService(self.get_config)
         reply_tracker_service = ReplyTrackerService()
